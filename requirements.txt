@@ -1,0 +1,6 @@
+# 本项目零第三方依赖，不需要 pip install 任何包。
+# 唯一要求：Python 3.9 及以上（开发与测试使用 3.14.7）。
+#
+# 可选：
+#   deepseek_judge.py 需要联网访问 https://api.deepseek.com
+#   事实核查需要联网访问 https://www.bing.com

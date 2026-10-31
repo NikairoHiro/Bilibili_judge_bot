@@ -1,0 +1,18 @@
+{
+  "outdir": "",
+  "state": "",
+  "outfile": "bilibili_at.txt",
+  "interval": 300,
+  "ai": true,
+  "reply": false,
+  "ai_model": "deepseek-flash",
+  "ai_key": "",
+  "ai_max_per_hour": 8,
+  "ai_max_per_day": 40,
+  "ai_min_interval": 45,
+  "no_search": false,
+  "auto_relogin": false,
+  "quiet_hours": "",
+  "allow_users": "",
+  "block_users": ""
+}
