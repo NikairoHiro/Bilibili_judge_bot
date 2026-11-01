@@ -12,6 +12,9 @@
   "ai_min_interval": 45,
   "no_search": false,
   "auto_relogin": false,
+  "ai_opinion_mode": "loose",
+  "admins": "",
+  "since": "",
   "quiet_hours": "",
   "allow_users": "",
   "block_users": ""

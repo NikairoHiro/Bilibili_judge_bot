@@ -44,6 +44,9 @@ DEFAULT_CONFIG = {
     "ai_min_interval": 45,
     "no_search": False,
     "auto_relogin": False,
+    "ai_opinion_mode": "loose",
+    "admins": "",
+    "since": "",
     "quiet_hours": "",
     "allow_users": "",
     "block_users": "",
@@ -103,8 +106,14 @@ def build_argv(cfg: dict) -> list:
             argv += ["--ai-key", str(cfg["ai_key"])]
         if cfg.get("no_search"):
             argv.append("--ai-no-search")
+        if cfg.get("ai_opinion_mode"):
+            argv += ["--ai-opinion-mode", str(cfg["ai_opinion_mode"])]
+        if cfg.get("admins"):
+            argv += ["--admins", str(cfg["admins"])]
     if cfg.get("reply"):
         argv.append("--reply")
+    if cfg.get("since"):
+        argv += ["--since", str(cfg["since"])]
     if cfg.get("auto_relogin"):
         argv.append("--auto-relogin")
     if cfg.get("quiet_hours"):
@@ -125,7 +134,6 @@ class Runner:
         self.lines = collections.deque(maxlen=3000)
         self.next_id = 1
         self.lock = threading.RLock()      # 可重入：_emit 会在持锁时被调用
-        self.login_proc = None
 
     def running(self) -> bool:
         proc = self.proc
@@ -204,30 +212,8 @@ class Runner:
         except Exception:
             pass
 
-    # ---- 扫码登录 ----
-    def start_login(self):
-        with self.lock:
-            if self.login_proc is not None and self.login_proc.poll() is None:
-                return False, "登录进程已在运行"
-            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
-            flags = subprocess.CREATE_NO_WINDOW if (os.name == "nt" and
-                                                    hasattr(subprocess, "CREATE_NO_WINDOW")) else 0
-            self.login_proc = subprocess.Popen(
-                [sys.executable, "-u", os.path.join(APP_DIR, "bili_at_monitor.py"), "--login"],
-                cwd=APP_DIR, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, encoding="utf-8", errors="replace", env=env,
-                creationflags=flags)
-            threading.Thread(target=self._login_reader, args=(self.login_proc,),
-                             daemon=True).start()
-            return True, "已开始扫码登录，二维码出现需要几秒"
-
-    def _login_reader(self, proc):
-        try:
-            for line in proc.stdout:
-                self._emit("[登录] " + line.rstrip("\r\n"))
-        except Exception:
-            pass
-        self._emit("[登录] 登录进程结束，返回码 %s" % proc.poll())
+    # 说明：控制台本身跑在浏览器里，浏览器开着就无法读取其 Cookie 库，
+    # 所以这里不提供「一键登录」，只给出命令，让用户在终端里执行。
 
 
 RUNNER = Runner()
@@ -350,15 +336,6 @@ class Handler(BaseHTTPRequestHandler):
             stat = bot.build_stats(st)
             return self._json({"ok": True, "stats": stat,
                                "text": bot.render_stats(stat)})
-        if path == "/api/qr.png":
-            png = os.path.join(APP_DIR, "qr_login.png")
-            if not os.path.isfile(png):
-                return self._json({"ok": False, "error": "二维码还没生成"}, 404)
-            try:
-                with open(png, "rb") as fh:
-                    return self._send(200, fh.read(), "image/png")
-            except Exception as exc:
-                return self._json({"ok": False, "error": str(exc)}, 500)
         return self._json({"ok": False, "error": "not found"}, 404)
 
     def do_POST(self):
@@ -384,9 +361,22 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"ok": False, "message": "保存失败：%s" % exc})
             return self._json({"ok": True, "message": "已保存", "config": {
                 k: ("" if k == "ai_key" else v) for k, v in saved.items()}})
-        if path == "/api/login":
-            ok, msg = RUNNER.start_login()
-            return self._json({"ok": ok, "message": msg})
+        if path == "/api/queue/cancel":
+            body = self._body()
+            cfg = load_config()
+            st = bot.load_state(cfg["state"])
+            q = bot.ReplyQueue(st)
+            keys = [str(k) for k in (body.get("keys") or [])]
+            if body.get("all"):
+                keys = [it.get("key") for it in q.pending]
+            n = 0
+            for key in keys:
+                if key in q.keys:
+                    q.drop(key, "手动取消")
+                    n += 1
+            if n:
+                bot.save_state(cfg["state"], st)
+            return self._json({"ok": True, "message": "已取消 %d 条队列任务" % n})
         return self._json({"ok": False, "error": "not found"}, 404)
 
 
@@ -487,6 +477,8 @@ HTML = r"""<!doctype html>
           <option value="dropped">已丢弃</option>
         </select>
         <span class="muted" id="q-count"></span>
+        <span class="spacer"></span>
+        <button class="danger" onclick="cancelAll()">清空待回复</button>
       </div>
       <table><thead id="q-head"></thead><tbody id="q-body"></tbody></table>
     </div>
@@ -533,8 +525,17 @@ HTML = r"""<!doctype html>
         <div><label>每日上限</label><input type="number" id="f-ai_max_per_day"></div>
         <div><label>最小间隔（秒）</label><input type="number" id="f-ai_min_interval"></div>
         <div><label>夜间静默（如 23:00-07:00）</label><input type="text" id="f-quiet_hours"></div>
+        <div><label>「只有观点」判定</label>
+          <select id="f-ai_opinion_mode">
+            <option value="loose">loose（默认，提到视频/上下文就不判）</option>
+            <option value="off">off（关闭，一律按论证处理）</option>
+            <option value="strict">strict（保留原判定）</option>
+          </select>
+        </div>
         <div><label>只回这些 UID（逗号分隔）</label><input type="text" id="f-allow_users"></div>
         <div><label>永不回复这些 UID</label><input type="text" id="f-block_users"></div>
+        <div><label>管理员 UID（不限次数/信用，显示 ∞）</label><input type="text" id="f-admins" placeholder="1331065292,123456"></div>
+        <div><label>只回复此时间之后的 @（留空=不限）</label><input type="text" id="f-since" placeholder="2026-11-01 08:30"></div>
       </div>
       <div class="row" style="margin-top:12px">
         <label style="margin:0"><input type="checkbox" id="f-ai"> 开启 AI 判定</label>
@@ -544,15 +545,30 @@ HTML = r"""<!doctype html>
       </div>
       <div class="row" style="margin-top:14px">
         <button class="primary" onclick="saveCfg()">保存配置</button>
-        <button onclick="act('login')">扫码登录</button>
         <span class="muted" id="cfg-hint"></span>
       </div>
     </div>
     <div class="panel">
-      <h2>登录二维码</h2>
+      <h2>登录：必须用命令行（重要）</h2>
+      <div class="hint">
+        控制台本身就在浏览器里运行，<strong>浏览器开着时 Cookie 库被独占锁定，读不到</strong>，
+        所以这里不能「一键登录」。请按下面两步操作：
+      </div>
+      <ol class="hint" style="margin:8px 0 8px 18px;padding:0">
+        <li>完全退出 Edge（任务栏图标右键 → 退出，不是只关窗口）</li>
+        <li>在项目目录打开终端，执行下面这条命令</li>
+      </ol>
       <div class="row">
-        <img id="qr" src="" alt="点「扫码登录」后出现" style="max-width:220px;border:1px solid var(--line);border-radius:10px;padding:6px;background:#fff">
-        <div class="hint">点「扫码登录」→ 用 B站 App 扫码 → 成功后二维码会消失/日志提示成功。</div>
+        <code style="background:#f1f3f5;padding:6px 10px;border-radius:6px">python bili_at_monitor.py --login</code>
+        <button onclick="copyLoginCmd()">复制命令</button>
+        <span class="muted" id="copy-hint"></span>
+      </div>
+      <div class="hint" style="margin-top:8px">
+        用 Chrome 就加 <code>--browser chrome</code>；多配置用 <code>--profile "Profile 1"</code>。<br>
+        如果 Cookie 是 <strong>v20（App-Bound）</strong> 加密，程序会自动启动一个无头浏览器，
+        用浏览器自己解密后取回，无需手动导出；<br>
+        实在读不到时，也可以手动复制 <code>SESSDATA</code> 与 <code>bili_jct</code>，
+        用 <code>--cookie "SESSDATA=...; bili_jct=..."</code> 传入。
       </div>
     </div>
   </section>
@@ -599,7 +615,6 @@ async function act(what){
   const r = await api('/api/'+what, {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
   toast(r.message || (r.ok?'完成':'失败'), !!r.ok);
   refresh();
-  if(what==='login') setTimeout(loadQr, 2500);
 }
 
 async function refresh(){
@@ -646,14 +661,24 @@ function escapeHtml(s){
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
+function copyLoginCmd(){
+  const cmd = 'python bili_at_monitor.py --login';
+  const done = () => { $('copy-hint').textContent = '已复制'; setTimeout(()=>{ $('copy-hint').textContent=''; }, 1500); };
+  if(navigator.clipboard && navigator.clipboard.writeText){
+    navigator.clipboard.writeText(cmd).then(done).catch(()=>prompt('复制这条命令：', cmd));
+  }else{
+    prompt('复制这条命令：', cmd);
+  }
+}
+
 async function loadQueue(){
   const which = $('q-which').value;
   const r = await api('/api/queue?which='+which);
   const items = r.items || [];
   $('q-count').textContent = '共 ' + items.length + ' 条';
   if(which==='pending'){
-    $('q-head').innerHTML = '<tr><th>事件</th><th>UID</th><th>昵称</th><th>@ 内容</th><th>父级评论</th><th>尝试</th><th>入队时间</th></tr>';
-    $('q-body').innerHTML = items.map(x=>'<tr><td>'+escapeHtml(x.key)+'</td><td>'+escapeHtml(String(x.mid||''))+'</td><td>'+escapeHtml(x.nickname||'')+'</td><td>'+escapeHtml(x.content||'')+'</td><td>'+escapeHtml(x.parent||'')+'</td><td>'+x.attempts+'</td><td>'+escapeHtml(x.added||'')+'</td></tr>').join('') || '<tr><td colspan="7" class="muted">空</td></tr>';
+    $('q-head').innerHTML = '<tr><th>事件</th><th>UID</th><th>昵称</th><th>@ 内容</th><th>父级评论</th><th>尝试</th><th>入队时间</th><th>操作</th></tr>';
+    $('q-body').innerHTML = items.map(x=>'<tr><td>'+escapeHtml(x.key)+'</td><td>'+escapeHtml(String(x.mid||''))+'</td><td>'+escapeHtml(x.nickname||'')+'</td><td>'+escapeHtml(x.content||'')+'</td><td>'+escapeHtml(x.parent||'')+'</td><td>'+x.attempts+'</td><td>'+escapeHtml(x.added||'')+'</td><td><button class="danger" onclick="cancelOne(\''+escapeHtml(x.key)+'\')">取消</button></td></tr>').join('') || '<tr><td colspan="8" class="muted">空</td></tr>';
   }else if(which==='done'){
     $('q-head').innerHTML = '<tr><th>事件</th><th>评论 rpid</th><th>时间</th><th>验证</th><th>目标</th></tr>';
     $('q-body').innerHTML = items.map(x=>'<tr><td>'+escapeHtml(x.key)+'</td><td>'+escapeHtml(x.rpid||'')+'</td><td>'+escapeHtml(x.time||'')+'</td><td>'+(x.verified?'<span class="tag" style="background:#e6f6ec;color:#12a150">通过</span>':'<span class="tag" style="background:#fdeceb;color:#d93026">未通过</span>')+'</td><td>'+escapeHtml(x.target||'')+'</td></tr>').join('') || '<tr><td colspan="5" class="muted">空</td></tr>';
@@ -661,6 +686,22 @@ async function loadQueue(){
     $('q-head').innerHTML = '<tr><th>事件</th><th>原因</th></tr>';
     $('q-body').innerHTML = items.map(x=>'<tr><td>'+escapeHtml(x.key)+'</td><td>'+escapeHtml(x.reason||'')+'</td></tr>').join('') || '<tr><td colspan="2" class="muted">空</td></tr>';
   }
+}
+
+async function cancelOne(key){
+  if(!confirm('确定取消这条队列任务？\n' + key)) return;
+  const r = await api('/api/queue/cancel', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({keys:[key]})});
+  toast(r.message || '已取消', !!r.ok);
+  loadQueue();
+}
+
+async function cancelAll(){
+  if(!confirm('确定清空所有待回复队列？此操作不可撤销。')) return;
+  const r = await api('/api/queue/cancel', {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({all:true})});
+  toast(r.message || '已清空', !!r.ok);
+  loadQueue();
 }
 
 async function loadReport(){
@@ -677,7 +718,7 @@ async function loadUsers(){
 async function loadCfg(){
   const r = await api('/api/summary');
   const c = r.config || {};
-  for(const k of ['outdir','state','outfile','interval','ai_model','ai_key','ai_max_per_hour','ai_max_per_day','ai_min_interval','quiet_hours','allow_users','block_users']){
+  for(const k of ['outdir','state','outfile','interval','ai_model','ai_key','ai_max_per_hour','ai_max_per_day','ai_min_interval','quiet_hours','allow_users','block_users','ai_opinion_mode','admins','since']){
     const el = $('f-'+k);
     if(el) el.value = (c[k]===undefined?'':c[k]);
   }
@@ -690,7 +731,7 @@ async function loadCfg(){
 
 async function saveCfg(){
   const body = {};
-  for(const k of ['outdir','state','outfile','interval','ai_model','ai_key','ai_max_per_hour','ai_max_per_day','ai_min_interval','quiet_hours','allow_users','block_users']){
+  for(const k of ['outdir','state','outfile','interval','ai_model','ai_key','ai_max_per_hour','ai_max_per_day','ai_min_interval','quiet_hours','allow_users','block_users','ai_opinion_mode','admins','since']){
     const el = $('f-'+k);
     if(el) body[k] = el.value;
   }
@@ -700,17 +741,6 @@ async function saveCfg(){
   }
   const r = await api('/api/config', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
   toast(r.message || '已保存', !!r.ok);
-}
-
-async function loadQr(){
-  const img = $('qr');
-  try{
-    const resp = await fetch('/api/qr.png?t='+Date.now());
-    if(resp.ok){
-      const blob = await resp.blob();
-      img.src = URL.createObjectURL(blob);
-    }
-  }catch(e){}
 }
 
 refresh();

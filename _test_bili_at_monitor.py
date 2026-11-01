@@ -95,6 +95,49 @@ p = resolve({"source_id": 99999, "root_id": 4242, "business_id": 1, "subject_id"
 check("父评论不存在 → 返回无法获取", p == m.UNKNOWN_MARK, p)
 
 # --------------------------------------------------------------------------
+# 1c. B站 feed 的 root_id 恒为 0 时，能否正确识别「回复他人」
+# --------------------------------------------------------------------------
+print("\n== root_id 推断 ==")
+
+check("native_uri 里的 comment_root_id",
+      m.feed_root_id({"native_uri": "bilibili://video/1?comment_root_id=5001&comment_secondary_id=5002"}) == 5001)
+check("target_id 兜底（仅视频）", m.feed_root_id({"target_id": 5001, "business_id": 1}) == 5001)
+check("非视频不用 target_id 兜底", m.feed_root_id({"target_id": 5001, "business_id": 17}) == 0)
+check("root_id 优先", m.feed_root_id({"root_id": 5001, "target_id": 9999}) == 5001)
+check("都没有 → 0", m.feed_root_id({}) == 0)
+
+item_reply = {
+    "source_id": SUB, "root_id": 0, "business_id": 1, "subject_id": 170001,
+    "source_content": "@我 你怎么看",
+    "native_uri": "bilibili://video/170001?comment_root_id=5001&comment_secondary_id=5002",
+}
+info_reply = resolve_info(item_reply)
+check("root_id=0 时仍判为「回复他人」", info_reply["at_is_direct"] is False, info_reply)
+check("root_id=0 时能取到父级评论", "这是父级评论的内容" in info_reply["text"], info_reply["text"])
+check("root_id=0 时回复目标是父级 rpid", info_reply["parent_rpid"] == ROOT, info_reply["parent_rpid"])
+
+item_top = {
+    "source_id": ROOT, "root_id": 0, "business_id": 1, "subject_id": 170001,
+    "source_content": "@我 这视频不错",
+    "native_uri": "bilibili://video/170001?comment_root_id=5001",
+}
+info_top = resolve_info(item_top)
+check("native root == 自身 → 判为一级评论",
+      info_top["at_is_direct"] is True and info_top["parent_is_self"] is True, info_top)
+
+item_lost = {
+    "source_id": 99999, "root_id": 4242, "business_id": 1, "subject_id": 170001,
+    "source_content": "@我 这段话你怎么看",
+    "native_uri": "bilibili://video/170001?comment_root_id=4242",
+}
+info_lost = resolve_info(item_lost)
+check("父级取不到 → 回退分析 @ 原文",
+      info_lost.get("parent_content") == "@我 这段话你怎么看"
+      and info_lost.get("fallback") is True, info_lost.get("text"))
+check("回退时仍可回复（目标是 @ 评论）",
+      info_lost["parent_rpid"] == 99999, info_lost["parent_rpid"])
+
+# --------------------------------------------------------------------------
 # 1b. 回复内容与回复目标
 # --------------------------------------------------------------------------
 print("\n== 回复内容 / 回复目标 ==")
@@ -661,6 +704,16 @@ check("特权 UID 后缀显示 ∞", "∞" in book.suffix(book.free_uid, "credit
       book.suffix(book.free_uid, "credit", 3))
 check("未配置特权 UID 时所有用户都扣减",
       uc.CreditBook({}).is_free("900000") is False)
+
+# 管理员名单（可多个）
+book_multi = uc.CreditBook({}, "", admins="900001, 900002，900003")
+check("管理员名单解析（中英文逗号）", book_multi.admin_uids == {"900001", "900002", "900003"},
+      book_multi.admin_uids)
+check("管理员 1 不扣信用", book_multi.spend("900001", "credit") == 3)
+check("管理员 2 不扣次数", book_multi.spend("900002", "times") == 3)
+check("非管理员正常扣减", book_multi.spend("900004", "credit") == 2)
+check("管理员后缀显示 ∞", "∞" in book_multi.suffix("900003", "times", 3))
+check("旧参数 free_uid 仍可用", book.is_free("900000") is True)
 check("越界值被夹到 0~3",
       book.ensure("222").get("times") == 3
       and book.users["222"]["credit"] == 3)
@@ -968,8 +1021,151 @@ check("统计：用户榜", _stat["top_users"][0]["uid"] == "111")
 _rendered = m.render_stats(_stat)
 check("统计：报表可渲染", "统计报表" in _rendered and "论证" in _rendered)
 
+# --------------------------------------------------------------------------
+# 12. 「只有观点」判定：上下文兜底 + 开关
+# --------------------------------------------------------------------------
+print("\n== 只有观点：上下文兜底 / 开关 ==")
+
+check("引用视频 → 视为有上下文", dj.references_context("视频里说得很清楚，这方案不行"))
+check("提到 up 主 → 视为有上下文", dj.references_context("UP主自己都承认了"))
+check("带数字 → 视为有上下文", dj.references_context("成本至少贵 30%"))
+check("纯表态 → 无上下文", not dj.references_context("这个方案肯定不行，反正就是错的"))
+
+
+class _JudgeChat:
+    """分类返回 opinion，其它一律返回固定回复文本。"""
+
+    def __init__(self):
+        self.prompts = []
+
+    def __call__(self, messages, **kwargs):
+        user = (messages or [{}])[-1].get("content", "")
+        self.prompts.append(user)
+        if "请判断下面这条评论的主要性质" in user:
+            return '{"category":"opinion","confidence":0.9,"claims":[],"fallacies":[]}'
+        return "这是回复文本。"
+
+
+def _mk_judge(mode):
+    j = dj.Judge("sk-fake", "deepseek-flash", opinion_mode=mode,
+                 log_func=lambda *a, **k: None)
+    j.chat = _JudgeChat()
+    return j
+
+
+def _ev(parent, title="", root=""):
+    return {"id": "o1", "mid": "2", "nickname": "x", "content": "@我 你怎么看",
+            "parent_content": parent, "grandparent_content": "",
+            "at_is_direct": False, "reply_type": 1, "reply_oid": 1,
+            "parent_rpid": 1, "root_rpid": 1, "video_title": title,
+            "thread_root": root}
+
+
+r_off = _mk_judge("off").build_reply(_ev("这个方案肯定不行"))
+check("opinion_mode=off → 一律按论证", r_off["category"] == "argument", r_off["category"])
+
+r_loose_ctx = _mk_judge("loose").build_reply(_ev("视频里说得很清楚，这方案不行"))
+check("loose：评论引用视频 → 不判「只有观点」", r_loose_ctx["category"] == "argument",
+      r_loose_ctx["category"])
+
+r_loose_bare = _mk_judge("loose").build_reply(_ev("这个方案肯定不行"))
+check("loose：纯表态仍判「只有观点」", r_loose_bare["category"] == "opinion",
+      r_loose_bare["category"])
+
+r_strict = _mk_judge("strict").build_reply(_ev("视频里说得很清楚，这方案不行"))
+check("strict：保留原判定", r_strict["category"] == "opinion", r_strict["category"])
+
+j_v = _mk_judge("off")
+j_v.build_reply(_ev("这个方案肯定不行", title="某某视频标题XYZ"))
+check("视频标题被拼进分类输入", any("某某视频标题XYZ" in p for p in j_v.chat.prompts),
+      len(j_v.chat.prompts))
+
+j_r = _mk_judge("strict")
+j_r.build_reply(_ev("这个方案肯定不行", root="楼层根评论ABC"))
+check("楼层根评论被拼进分类输入", any("楼层根评论ABC" in p for p in j_r.chat.prompts),
+      len(j_r.chat.prompts))
+
+check("「只有观点」分支不再索要证据", "不索要证据" in (r_strict.get("reason") or ""),
+      r_strict.get("reason"))
+
+# --------------------------------------------------------------------------
+# 13. 时间过滤器 --since
+# --------------------------------------------------------------------------
+print("\n== 时间过滤器 ==")
+
+_ts = m.parse_since("2026-11-01 08:30")
+check("parse_since：日期+时间",
+      _ts is not None and _dt.fromtimestamp(_ts).strftime("%Y-%m-%d %H:%M") == "2026-11-01 08:30")
+check("parse_since：只有日期", m.parse_since("2026-11-01") is not None)
+check("parse_since：斜杠与全角", m.parse_since("2026／11／01 08：30") is not None)
+check("parse_since：空串 → 0", m.parse_since("") == 0)
+check("parse_since：非法 → None", m.parse_since("不是时间") is None)
+
+_OLD = int(_dt(2026, 10, 1, 12, 0).timestamp())
+_NEW = int(_dt(2026, 11, 2, 12, 0).timestamp())
+_SINCE = int(_dt(2026, 11, 1).timestamp())
+
+st_s = {}
+q_s = m.ReplyQueue(st_s)
+q_s.enqueue("old", {"id": "old", "ts": _OLD, "replyable": True,
+                    "reply_type": 1, "reply_oid": 1, "parent_rpid": 1,
+                    "root_rpid": 1, "mid": "1", "nickname": "x"})
+q_s.enqueue("new", {"id": "new", "ts": _NEW, "replyable": True,
+                    "reply_type": 1, "reply_oid": 1, "parent_rpid": 2,
+                    "root_rpid": 2, "mid": "2", "nickname": "y"})
+_removed = q_s.purge_before(_SINCE)
+check("队列清理：移除早于过滤器的事件", _removed == 1 and list(q_s.keys) == ["new"],
+      "%s / %s" % (_removed, list(q_s.keys)))
+
+# queue_reply 入队时也会跳过旧事件
+st_q2 = {}
+_a_s = _QArgs()
+_a_s.since_ts = _SINCE
+_r_s = _QResolver()
+_evs = {"old": _mk_ev("old"), "new": _mk_ev("new")}
+_evs["old"]["ts"] = _OLD
+_evs["new"]["ts"] = _NEW
+m.queue_reply(_evs, ["old", "new"], _a_s, st_q2, _r_s)
+check("入队时跳过早于过滤器的事件", _r_s.posts == ["new"], _r_s.posts)
+
+# --------------------------------------------------------------------------
+# 14. 手动取消队列任务
+# --------------------------------------------------------------------------
+print("\n== 手动取消队列 ==")
+
+_st_c = {}
+_q_c = m.ReplyQueue(_st_c)
+for _i in (1, 2, 3):
+    _q_c.enqueue("evt%d" % _i, {"id": "evt%d" % _i, "ts": _NEW, "replyable": True,
+                                "reply_type": 1, "reply_oid": 1, "parent_rpid": _i,
+                                "root_rpid": _i, "mid": str(100 + _i),
+                                "nickname": "用户%d" % _i, "content": "@我 第%d条" % _i})
+_cp = os.path.join(OUT, "cancel_state.json")
+m.save_state(_cp, _st_c)
+
+check("--queue-list 返回 0", m.run(["--queue-list", "--state", _cp]) == 0)
+
+check("--cancel-queue 按序号取消", m.run(["--cancel-queue", "2", "--state", _cp]) == 0)
+_st2 = m.load_state(_cp)
+_pending2 = [i["key"] for i in _st2["reply_queue"]["pending"]]
+check("序号 2 已被移除", "evt2" not in _pending2 and len(_pending2) == 2, _pending2)
+check("被取消的记入 dropped", "evt2" in (_st2["reply_queue"].get("dropped") or {}),
+      list((_st2["reply_queue"].get("dropped") or {}).keys()))
+
+check("--cancel-queue 按 key 取消", m.run(["--cancel-queue", "evt1", "--state", _cp]) == 0)
+_st3 = m.load_state(_cp)
+check("key 取消生效", [i["key"] for i in _st3["reply_queue"]["pending"]] == ["evt3"],
+      [i["key"] for i in _st3["reply_queue"]["pending"]])
+
+check("--cancel-queue all 清空", m.run(["--cancel-queue", "all", "--state", _cp]) == 0)
+_st4 = m.load_state(_cp)
+check("all 之后队列为空", not _st4["reply_queue"]["pending"],
+      len(_st4["reply_queue"]["pending"]))
+
+check("取消不存在的 key 不报错", m.run(["--cancel-queue", "nope", "--state", _cp]) == 0)
+
 print()
 if FAILS:
     print("[×] 失败 %d 项：%s" % (len(FAILS), FAILS))
     sys.exit(1)
-print("[√] 全部离线自测通过（父级评论 / 原地更新 / 常驻定时 / AI 法官 / 次数信用 / 队列 / 安全屏蔽 / 关注与配额 / 稳定性与报表）")
+print("[√] 全部离线自测通过（父级评论 / 原地更新 / 常驻定时 / AI 法官 / 次数信用 / 队列 / 安全屏蔽 / 关注与配额 / 稳定性与报表 / 观点判定 / 时间过滤器 / 队列取消）")

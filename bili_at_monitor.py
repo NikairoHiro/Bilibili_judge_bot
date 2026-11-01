@@ -3,7 +3,7 @@
 """
 bili_at_monitor.py —— B站网页端「@我的」事件抓取脚本（后台定时版）
 
-版本：1.0.0
+版本：1.0.1
 许可：MIT
 
 功能
@@ -39,7 +39,7 @@ bili_at_monitor.py —— B站网页端「@我的」事件抓取脚本（后台�
     python bili_at_monitor.py --check
 
     # 其它
-    python bili_at_monitor.py --login            # 扫码登录
+    python bili_at_monitor.py --login            # 从浏览器读取 Cookie
     python bili_at_monitor.py --outfile my.txt   # 换输出文件名（仍然是原地更新）
     python bili_at_monitor.py --days 7           # 只保留最近 7 天的 @
     python bili_at_monitor.py --status           # 看上次抓取时间/累计条数
@@ -64,7 +64,7 @@ from datetime import datetime, timedelta
 # 常量
 # --------------------------------------------------------------------------
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 UA = (
@@ -87,8 +87,6 @@ VIEW_API = "https://api.bilibili.com/x/web-interface/view"
 COMMENT_API = "https://api.bilibili.com/x/v2/reply"          # 顶层评论列表
 SUB_COMMENT_API = "https://api.bilibili.com/x/v2/reply/reply"  # 某条评论下的回复
 REPLY_ADD_API = "https://api.bilibili.com/x/v2/reply/add"    # 发表评论/回复（POST）
-QR_GEN_API = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
-QR_POLL_API = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
 FINGER_API = "https://api.bilibili.com/x/frontend/finger/spi"  # 取 buvid 风控指纹
 FOLLOWERS_API = "https://api.bilibili.com/x/relation/followers"  # 我的粉丝列表
 
@@ -602,6 +600,43 @@ def _bare_cookie_text(raw: str) -> str:
     return "SESSDATA=" + urllib.parse.quote(text, safe="%*,.")
 
 
+def _read_cookie_file(path: str) -> str:
+    """尽量宽容地读取 cookie.txt。
+
+    兼容：UTF-8 / UTF-8 BOM / UTF-16（记事本「Unicode」）/ GBK、
+    多行写法、带 Cookie: 前缀、带引号、# 注释行、裸 SESSDATA 值。
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return ""
+    if not data.strip():
+        return ""
+    text = None
+    for enc in ("utf-8-sig", "utf-16", "utf-16-le", "gbk"):
+        try:
+            text = data.decode(enc)
+            break
+        except (UnicodeDecodeError, UnicodeError):
+            continue
+    if text is None:
+        text = data.decode("utf-8", errors="replace")
+
+    chunks = []
+    for line in text.splitlines():
+        s = line.strip().strip('"').strip("'")
+        if not s or s.startswith("#"):
+            continue
+        low = s.lower()
+        if low.startswith("cookie:"):
+            s = s.split(":", 1)[1].strip()
+        elif low.startswith("set-cookie:"):
+            s = s.split(":", 1)[1].strip().split(";")[0].strip()
+        chunks.append(s)
+    return "; ".join(chunks)
+
+
 def load_cookie(args) -> str:
     sources = [
         getattr(args, "cookie", None),
@@ -613,14 +648,16 @@ def load_cookie(args) -> str:
         if val:
             return fix_double_prefix(normalize_cookie(val))
 
-    path = os.path.join(APP_DIR, "cookie.txt")
+    path = getattr(args, "cookie_file", "") or os.path.join(APP_DIR, "cookie.txt")
     if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8-sig", errors="replace") as fh:
-            raw = fh.read().strip()
+        raw = _read_cookie_file(path)
         if raw:
             fixed = fix_double_prefix(_bare_cookie_text(raw))
             if extract_cookie_value(fixed, "SESSDATA"):
                 return fixed
+            log("%s 里没解析出 SESSDATA（格式/编码可能不对），已忽略它" % path, "warn")
+    elif getattr(args, "cookie_file", ""):
+        log("找不到指定的 Cookie 文件：%s" % path, "warn")
 
     state = load_state(getattr(args, "state", DEFAULT_STATE))
     state_cookie = fix_double_prefix(normalize_cookie(state.get("cookie") or ""))
@@ -633,12 +670,15 @@ def print_login_help():
     name = os.path.basename(sys.argv[0])
     log("没有可用的登录信息，请任选一种方式：", "err")
     print(
-        "    1) 扫码登录：  python %s --login\n"
+        "    1) 从浏览器读取（推荐）：先完全退出 Edge，再执行\n"
+        "         python %s --login\n"
+        "       也可以用 --browser chrome 读 Chrome，--profile \"Profile 1\" 指定配置\n"
         "    2) 传 SESSDATA：python %s --sessdata 你的SESSDATA\n"
         "    3) 传整串 Cookie：python %s --cookie \"SESSDATA=xxx; bili_jct=xxx\"\n"
         "    4) 新建 cookie.txt，里面写一行 SESSDATA=xxx\n"
-        "    获取方法：浏览器登录 bilibili.com → F12 → Application/存储 → Cookie →\n"
-        "              复制 https://www.bilibili.com 下的 SESSDATA" % (name, name, name)
+        "    手动获取：浏览器登录 bilibili.com → F12 → Application → Cookies →\n"
+        "              复制 https://www.bilibili.com 下的 SESSDATA 与 bili_jct"
+        % (name, name, name)
     )
 
 
@@ -675,145 +715,26 @@ def save_cookie_to_state(cookie: str, state_path: str = DEFAULT_STATE):
 
 
 # --------------------------------------------------------------------------
-# 扫码登录（纯离线二维码：qr_offline.py）
+# 登录：直接从浏览器读取 B站 Cookie（扫码登录时效性太差，已移除）
 # --------------------------------------------------------------------------
 
 
-def _load_qr_module():
+def browser_login(browser: str = "edge", profile: str = "") -> str:
+    """从本机 Edge / Chrome 的 Cookie 库读取 B站登录信息，保存并返回。"""
     try:
-        import qr_offline
-        return qr_offline
-    except Exception:
-        return None
-
-
-def _qr_html(data_uri: str, path: str, link: str) -> bool:
+        import edge_cookie
+    except Exception as exc:
+        raise RuntimeError("无法加载 edge_cookie.py：%s" % exc)
     try:
-        html = (
-            "<!doctype html><meta charset='utf-8'><title>B站扫码登录</title>"
-            "<body style='font-family:sans-serif;text-align:center;padding:40px;background:#f6f7f9'>"
-            "<h2>用「哔哩哔哩」手机客户端扫码登录</h2>"
-            "<p>打开 App → 左上角头像 → 扫一扫</p>"
-            "<img src='%s' width='320' height='320' style='background:#fff;padding:12px;border-radius:8px'>"
-            "<p style='color:#888'>二维码有效期约 3 分钟，扫码后在手机上点「确认登录」。</p>"
-            "<p style='color:#888;font-size:12px'>本页二维码为本地生成、内嵌图片，断网也能正常显示。</p>"
-            "<p style='color:#bbb;font-size:12px;word-break:break-all'>%s</p></body>"
-            % (data_uri, link)
-        )
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(html)
-        return True
-    except Exception:
-        return False
-
-
-def qr_login(timeout_sec: int = 300) -> str:
-    """扫码登录，返回可用的 Cookie 字符串。"""
-    import base64
-
-    payload = api_call(QR_GEN_API, referer="https://www.bilibili.com/")
-    data = payload.get("data") or {}
-    qr_url = data.get("url")
-    qr_key = data.get("qrcode_key")
-    if not qr_url or not qr_key:
-        raise RuntimeError("获取二维码失败：%s" % json.dumps(payload, ensure_ascii=False)[:300])
-
-    qr = _load_qr_module()
-    if qr is None:
-        log("未找到 qr_offline.py，无法生成离线二维码，可直接打开下面的链接扫码。", "warn")
-        print("    登录链接：%s" % qr_url)
-    else:
-        code = qr.QRCode(qr_url)
-        png = code.to_png_bytes(scale=8, border=4)
-        png_path = os.path.join(APP_DIR, "qr_login.png")
-        with open(png_path, "wb") as fh:
-            fh.write(png)
-        html_path = os.path.join(APP_DIR, "qr_login.html")
-        data_uri = "data:image/png;base64," + base64.b64encode(png).decode("ascii")
-        _qr_html(data_uri, html_path, qr_url)
-        log("二维码已生成：%s（离线，可放心断网）" % png_path, "ok")
-        if sys.stdout.isatty():
-            print(code.to_ascii(border=2, color=True))
-        log("已打开二维码页面；若浏览器没弹出，请手动双击 %s" % html_path)
-        try:
-            import webbrowser
-            webbrowser.open("file:///" + html_path.replace("\\", "/"))
-        except Exception:
-            pass
-        print("    登录链接：%s" % qr_url)
-
-    log("等待扫码（最长 %d 秒，Ctrl+C 取消）..." % timeout_sec)
-    print("    请用手机 B 站 App 扫描上面打开的二维码；扫完记得在手机上点「确认登录」。")
-    deadline = time.time() + timeout_sec
-    notified = False
-    last_code = None
-    while time.time() < deadline:
-        time.sleep(2)
-        try:
-            payload = api_call(QR_POLL_API + "?qrcode_key=" + urllib.parse.quote(qr_key),
-                               referer="https://www.bilibili.com/")
-        except Exception as exc:
-            if not _QUIET:
-                print("    (轮询失败，继续重试：%s)" % str(exc)[:60])
-            continue
-        d = payload.get("data") or {}
-        code = d.get("code")
-        if code != last_code:
-            last_code = code
-        if code == 0:
-            cookie = _collect_set_cookie(qr_key) or _cookie_from_return_url(d.get("url") or "")
-            if not cookie:
-                raise RuntimeError("登录成功但没能取到 Cookie，请改用 --sessdata。")
-            save_cookie_to_state(cookie)
-            log("登录成功！Cookie 已保存到 cookie.txt 与 %s" % DEFAULT_STATE, "ok")
-            log("接下来直接运行：python %s" % os.path.basename(sys.argv[0] or __file__), "ok")
-            return cookie
-        if code == 86038:
-            # 过期是最常见的失败：链接只有约 3 分钟寿命，且退出后二维码立即作废
-            raise RuntimeError(
-                "二维码已过期（链接寿命约 3 分钟，且脚本退出后立即失效）。"
-                "请重新执行 --login，并尽快用手机扫码确认。")
-        if code == 86090 and not notified:
-            log("已扫码！请在手机上点「确认登录」，脚本会继续等待 ...", "ok")
-            notified = True
-        elif code == 86101 and not _QUIET:
-            remain = int(deadline - time.time())
-            if remain % 20 < 2:
-                print("    (还未检测到扫码，剩余 %d 秒；若没看到二维码请双击同目录的 qr_login.html)" % remain)
-    raise RuntimeError(
-        "等待扫码超时（%d 秒内没有完成登录）。常见原因：二维码已过期、手机没点确认、"
-        "或扫的是上次留下的旧二维码。请重新执行 --login。" % timeout_sec)
-
-
-def _cookie_from_return_url(url: str) -> str:
-    if not url:
-        return ""
-    params = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-    pairs = []
-    for key in ("SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5"):
-        if params.get(key):
-            pairs.append("%s=%s" % (key, params[key][0]))
-    return "; ".join(pairs)
-
-
-def _collect_set_cookie(qr_key: str) -> str:
-    try:
-        import http.cookiejar
-        jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(jar),
-            urllib.request.HTTPSHandler(context=_build_context(False)),
-        )
-        req = urllib.request.Request(
-            QR_POLL_API + "?qrcode_key=" + urllib.parse.quote(qr_key),
-            headers={**HEADERS, "Referer": "https://www.bilibili.com/"},
-        )
-        opener.open(req, timeout=20).read()
-        pairs = ["%s=%s" % (c.name, c.value) for c in jar
-                 if c.name in ("SESSDATA", "bili_jct", "DedeUserID", "DedeUserID__ckMd5")]
-        return "; ".join(pairs)
-    except Exception:
-        return ""
+        cookies = edge_cookie.read_bilibili_cookies(browser, profile)
+    except edge_cookie.EdgeCookieError as exc:
+        raise RuntimeError(str(exc))
+    header = edge_cookie.cookie_header(cookies)
+    if not header or "SESSDATA" not in header:
+        raise RuntimeError("没有读到 SESSDATA：请先在浏览器里登录 B站，或改用 --cookie 手动传入")
+    save_cookie_to_state(header)
+    log("已从 %s（%s）读取 Cookie 并保存" % (browser, cookies.get("_profile") or "默认配置"), "ok")
+    return header
 
 
 # --------------------------------------------------------------------------
@@ -913,9 +834,11 @@ class CommentResolver:
         self.replied = replied if replied is not None else {}
         self.cache = {}
         self.bv_cache = {}
+        self.video_cache = {}
         self.csrf_failures = 0
         self.level_too_low = False
         self._csrf = extract_cookie_value(cookie, "bili_jct")
+        self._ban_until = 0     # 评论接口 412 风控冷却截止时间
         # AI 判定（deepseek_judge.Judge）；为 None 时走旧的「去 @ 后原文」逻辑
         self.judge = None
         self._ai_cache = {}     # dry-run 时缓存生成结果，避免每轮重复烧 token
@@ -924,13 +847,22 @@ class CommentResolver:
 
     # -- 工具 --------------------------------------------------------
     def _call(self, url):
+        is_reply_api = "x/v2/reply" in url
+        if is_reply_api and time.time() < getattr(self, "_ban_until", 0):
+            raise RuntimeError("评论接口风控冷却中（412），稍后再试")
         time.sleep(min(self.delay, 2.0))
         # 评论列表类接口一律先做 WBI 签名，避免被 412「request was banned」风控拦截
-        if "x/v2/reply" in url:
+        if is_reply_api:
             url = sign_url(url, self.cookie)
-        return api_call(url, cookie=self.cookie, timeout=self.timeout,
-                        retry_delay=self.delay, verify=self.verify,
-                        referer="https://www.bilibili.com/")
+        try:
+            return api_call(url, cookie=self.cookie, timeout=self.timeout,
+                            retry_delay=self.delay, verify=self.verify,
+                            referer="https://www.bilibili.com/")
+        except RuntimeError as exc:
+            if is_reply_api and ("412" in str(exc) or "banned" in str(exc)):
+                self._ban_until = time.time() + 120
+                log("  · 评论接口返回 412（风控），暂停评论查询 120 秒", "warn")
+            raise
 
     def bv_from_aid(self, aid) -> str:
         aid = str(aid)
@@ -945,6 +877,27 @@ class CommentResolver:
         self.bv_cache[aid] = bvid
         return bvid
 
+    def video_meta(self, bvid: str) -> dict:
+        """取视频标题 / 简介 / 分区（缓存）。用于让 AI 知道「论据可能在视频里」。"""
+        bvid = (bvid or "").strip()
+        if not bvid:
+            return {}
+        if bvid in self.video_cache:
+            return self.video_cache[bvid]
+        meta = {}
+        try:
+            payload = self._call(VIEW_API + "?" + urllib.parse.urlencode({"bvid": bvid}))
+            data = payload.get("data") or {}
+            meta = {
+                "title": (data.get("title") or "").strip(),
+                "desc": (data.get("desc") or "").strip(),
+                "tname": (data.get("tname") or "").strip(),
+            }
+        except Exception:
+            meta = {}
+        self.video_cache[bvid] = meta
+        return meta
+
     # -- 父级评论 ----------------------------------------------------
     @staticmethod
     def _norm_reply(reply: dict) -> dict:
@@ -958,19 +911,28 @@ class CommentResolver:
             if reply.get("ctime") else "",
         }
 
-    def get_comment(self, ctype, oid, rpid, root=0) -> dict:
-        """在评论区里定位某条评论（rpid）。先查顶层列表，必要时查子评论列表。"""
-        key = (ctype, str(oid), str(rpid))
-        if key in self.cache:
-            return self.cache[key]
+    def _scan_sub_comments(self, ctype, oid, root, rpid, max_pages=10) -> dict:
+        """在某条评论（root）的子评论里按 rpid 查找；找不到返回 None。"""
+        for pn in range(1, max_pages + 1):
+            url = SUB_COMMENT_API + "?" + urllib.parse.urlencode({
+                "type": ctype, "oid": oid, "root": root, "ps": 20, "pn": pn,
+            })
+            try:
+                payload = self._call(url)
+            except Exception:
+                return None
+            replies = (payload.get("data") or {}).get("replies") or []
+            if not replies:
+                return None
+            for r in replies:
+                if str(r.get("rpid")) == str(rpid):
+                    return r
+        return None
 
-        found = None
-        # 1) 顶层评论列表：先按热度(sort=2)，再按时间(sort=0)
-        #    新发的评论 0 赞，在热度排序里可能排在很后面，只翻热度会找不到
+    def _scan_top_level(self, ctype, oid, rpid, max_pages=4) -> dict:
+        """在顶层评论列表里查找（含列表自带的少量子评论预览）。"""
         for sort in (2, 0):
-            if found:
-                break
-            for pn in (1, 2, 3):
+            for pn in range(1, max_pages + 1):
                 url = COMMENT_API + "?" + urllib.parse.urlencode({
                     "type": ctype, "oid": oid, "sort": sort, "ps": 20, "pn": pn,
                     "nohot": 1,
@@ -984,43 +946,50 @@ class CommentResolver:
                     break
                 for r in replies:
                     if str(r.get("rpid")) == str(rpid):
-                        found = r
-                        break
+                        return r
                     for sub in (r.get("replies") or []):
                         if str(sub.get("rpid")) == str(rpid):
-                            found = sub
-                            break
-                    if found:
-                        break
-                if found:
-                    break
+                            return sub
+        return None
 
-        # 2) 还没找到，并且知道 root，就去子评论列表里翻
-        if found is None and root and str(root) != "0":
-            for pn in (1, 2, 3, 4, 5):
-                url = SUB_COMMENT_API + "?" + urllib.parse.urlencode({
-                    "type": ctype, "oid": oid, "root": root, "ps": 20, "pn": pn,
-                })
-                try:
-                    payload = self._call(url)
-                except Exception:
-                    break
-                replies = (payload.get("data") or {}).get("replies") or []
-                if not replies:
-                    break
-                for r in replies:
-                    if str(r.get("rpid")) == str(rpid):
-                        found = r
-                        break
-                if found:
-                    break
-        self.cache[key] = found
+    def get_comment(self, ctype, oid, rpid, root=0) -> dict:
+        """在评论区里定位某条评论（rpid）。
+
+        B站 2026 起 msgfeed 的 item.root_id 恒为 0，调用方会用 native_uri 里的
+        comment_root_id 补上 root。已知 root 且不是它自己时，优先翻该楼的子评论，
+        比扫顶层列表更快也更准。
+        """
+        key = (ctype, str(oid), str(rpid))
+        if key in self.cache:
+            return self.cache[key]
+        if time.time() < self._ban_until:
+            return None                     # 风控冷却中：不查、也不缓存
+
+        try:
+            rpid_i = int(rpid)
+            root_i = int(root or 0)
+        except (TypeError, ValueError):
+            self.cache[key] = None
+            return None
+
+        ban_before = self._ban_until
+        found = None
+        if root_i and root_i != rpid_i:
+            found = self._scan_sub_comments(ctype, oid, root_i, rpid_i)
+        if found is None and (not root_i or root_i == rpid_i):
+            found = self._scan_top_level(ctype, oid, rpid_i)
+        if found is None and root_i and root_i != rpid_i:
+            found = self._scan_sub_comments(ctype, oid, root_i, rpid_i)
+
+        if self._ban_until == ban_before:   # 风控导致的「没找到」不写缓存
+            self.cache[key] = found
         return found
 
     def resolve_parent(self, item: dict, business_id, subject_id) -> dict:
         """解析父级评论，并给出回复所需的信息。"""
         source_id = int(item.get("source_id") or 0)
-        root_id = int(item.get("root_id") or 0)
+        # 注意：msgfeed 的 item.root_id 现在恒为 0，必须从 native_uri / target_id 推断
+        root_id = feed_root_id(item)
         ctype = self._comment_type(business_id)
 
         info = {
@@ -1050,15 +1019,17 @@ class CommentResolver:
             info["text"] = UNKNOWN_MARK
             return info
 
-        comment = None
-        try:
-            comment = self.get_comment(ctype, subject_id, source_id, root=root_id)
-        except Exception:
-            comment = None
+        # 是否「直接评论视频」的一级评论：root 缺失，或 root 就是它自己
+        is_top_comment = (not root_id) or (bool(source_id) and root_id == source_id)
 
-        # 判定是否本身就是一级评论
-        is_root_comment = (root_id == 0 and (comment is None or not comment.get("root")))
-        if is_root_comment:
+        comment = None
+        if source_id and not is_top_comment:
+            try:
+                comment = self.get_comment(ctype, subject_id, source_id, root=root_id)
+            except Exception:
+                comment = None
+
+        if is_top_comment:
             info["text"] = NONE_MARK
             info["parent_is_self"] = True
             info["parent_rpid"] = source_id
@@ -1073,29 +1044,35 @@ class CommentResolver:
         if comment is not None:
             parent_id = int(comment.get("parent") or 0)
         if not parent_id:
+            # 抓不到源评论时退而求其次：直接回复根评论（二级回复时这就是父级）
             parent_id = root_id
 
-        if not parent_id:
-            info["text"] = NONE_MARK
-            info["parent_is_self"] = True
-            info["parent_rpid"] = source_id
-            info["root_rpid"] = source_id
-            info["target_desc"] = "@ 我的那条评论本身（一级评论）"
-            info["parent_is_direct"] = True   # 本身就是直接评论视频
-            info["at_is_direct"] = True       # @ 评论本身是一级评论
-            info["parent_content"] = (item.get("source_content") or "").strip()
-            return info
+        info["parent_rpid"] = parent_id
+        info["root_rpid"] = root_id or int((comment or {}).get("root") or parent_id)
+        info["target_desc"] = "父级评论 rpid=%s" % parent_id
 
         parent = None
         try:
-            parent = self.get_comment(ctype, subject_id, parent_id, root=root_id or parent_id)
+            parent = self.get_comment(ctype, subject_id, parent_id,
+                                      root=root_id or parent_id)
         except Exception:
             parent = None
-
-        info["parent_rpid"] = parent_id
-        info["root_rpid"] = int((comment or {}).get("root") or root_id or parent_id)
-        info["target_desc"] = "父级评论 rpid=%s" % parent_id
         if not parent:
+            # 父级取不到（风控 / 已删除 / 折叠）：退化为直接分析 @ 原文，仍然能回复
+            at_text = (item.get("source_content") or "").strip()
+            if at_text:
+                info["parent_content"] = at_text
+                info["parent_author"] = ""
+                info["parent_is_self"] = True
+                info["parent_rpid"] = source_id
+                info["root_rpid"] = root_id
+                info["at_rpid"] = source_id
+                info["at_root"] = root_id or source_id
+                info["at_is_direct"] = False
+                info["fallback"] = True
+                info["text"] = ("（父级评论获取失败，改用 @ 原文）「%s」"
+                                % at_text[:80])
+                return info
             info["text"] = UNKNOWN_MARK
             return info
         p = self._norm_reply(parent)
@@ -1228,7 +1205,7 @@ class CommentResolver:
                 raise RuntimeError(
                     "发表回复被风控拦截：code=%s message=%s —— 已带 WBI/DM 签名重试仍失败，"
                     "通常是账号/设备被风控（可能返回 v_voucher 验证码）。"
-                    "建议：隔一段时间再试、降低频率、或重新扫码登录换新会话。"
+                    "建议：隔一段时间再试、降低频率、或重新从浏览器导入 Cookie 换新会话。"
                     % (code, payload.get("message")))
             raise RuntimeError("发表回复失败：code=%s message=%s"
                                % (code, payload.get("message")))
@@ -1303,12 +1280,19 @@ class CommentResolver:
         info = {"parent_exists": False, "reply_rpid": "", "checked": False, "why": ""}
         if not ctype or not oid:
             return info
+        if time.time() < getattr(self, "_ban_until", 0):
+            # 评论接口正在风控冷却：不能据此判定评论不存在
+            info["why"] = "评论接口风控冷却中（412），稍后重试"
+            return info
         parent_rpid = str(parent_rpid or "")
         try:
             parent_obj = self.get_comment(ctype, oid, parent_rpid,
                                           root=root_rpid or parent_rpid)
         except Exception:
             parent_obj = None
+        if time.time() < getattr(self, "_ban_until", 0):
+            info["why"] = "评论接口风控冷却中（412），稍后重试"
+            return info
         info["checked"] = True
         if parent_obj:
             info["parent_exists"] = True
@@ -1406,7 +1390,10 @@ class CommentResolver:
         oid = ev.get("reply_oid")
         at_rpid, at_root = self._target_ids(ev, "at")
         info = self.verify_on_platform(ctype, oid, at_rpid, at_root, find_replies=False)
-        if info["checked"] and not info["parent_exists"]:
+        if not info["checked"]:
+            result.update(skipped=True, reason=info["why"] or "无法确认 @ 评论，稍后重试")
+            return result
+        if not info["parent_exists"]:
             result.update(skipped=True, reason="找不到该 @ 评论，跳过")
             return result
         result.update(message=text, target="at", target_rpid=at_rpid,
@@ -1494,6 +1481,10 @@ class CommentResolver:
                 # 已取消「不重复回复」规则：不再检查是否回复过，只确认评论还在
                 info_at = self.verify_on_platform(ctype, oid, at_rpid, at_root,
                                                   find_replies=False)
+                if not info_at["checked"]:
+                    result.update(skipped=True,
+                                  reason=info_at["why"] or "无法确认 @ 评论，稍后重试")
+                    return result
                 if not info_at["parent_exists"]:
                     result.update(skipped=True, reason="找不到该 @ 评论，跳过")
                     return result
@@ -1518,6 +1509,11 @@ class CommentResolver:
         if info["checked"] and not info["parent_exists"]:
             result["skipped"] = True
             result["reason"] = info["why"] + "，跳过回复"
+            return result
+        if not info["checked"]:
+            # 风控 / 网络问题导致没查成：不算「评论不存在」，留给下一轮重试
+            result["skipped"] = True
+            result["reason"] = info["why"] or "无法确认目标评论，稍后重试"
             return result
 
         # ---- ③ 生成回复内容：AI 法官模式 / 旧的「去 @ 原文」模式 ----
@@ -1667,6 +1663,34 @@ def fetch_feed(api_url: str, cookie: str, max_pages: int, timeout: int,
 _BV_RE = re.compile(r"(BV[0-9A-Za-z]{10})")
 
 
+def feed_root_id(item: dict) -> int:
+    """推断一条 @ 所在评论楼的 root rpid。
+
+    B站 2026 起 msgfeed 的 item.root_id 恒为 0（导致「回复他人的评论」被误判成
+    一级评论），但同一条目里还带着：
+      · native_uri / uri 的 comment_root_id=<root rpid>
+      · target_id（多数场景等于 root rpid）
+    依次兜底，拿不到再返回 0。
+    """
+    try:
+        root = int(item.get("root_id") or 0)
+    except (TypeError, ValueError):
+        root = 0
+    if root:
+        return root
+    uri = item.get("native_uri") or item.get("uri") or ""
+    m = re.search(r"comment_root_id=(\d+)", uri)
+    if m:
+        return int(m.group(1))
+    # target_id 只在视频评论区可靠（动态/专栏的 target_id 另有含义）
+    try:
+        if int(item.get("business_id") or 0) == 1:
+            return int(item.get("target_id") or 0)
+    except (TypeError, ValueError):
+        pass
+    return 0
+
+
 def convert_av_to_bv(aid) -> str:
     try:
         aid_int = int(aid)
@@ -1725,6 +1749,11 @@ def parse_event(raw: dict, show_content: bool, resolver: CommentResolver = None)
 
     content = re.sub(r"\s+", " ", (item.get("source_content") or item.get("title") or "")).strip()
 
+    # msgfeed 的 item.title 就是楼层根评论原文，白送的一段上下文
+    thread_root = re.sub(r"\s+", " ", (item.get("title") or "")).strip()
+    if thread_root == content:
+        thread_root = ""
+
     parent_text = ""
     pinfo = {}
     if resolver is not None:
@@ -1734,6 +1763,16 @@ def parse_event(raw: dict, show_content: bool, resolver: CommentResolver = None)
         except Exception as exc:
             parent_text = "获取父级评论出错：%s" % exc
 
+    # 视频标题 / 简介：评论里的论据常常在视频里，给模型一点上下文再判断
+    video_title, video_desc = "", ""
+    if resolver is not None and bv:
+        try:
+            meta = resolver.video_meta(bv) or {}
+            video_title = (meta.get("title") or "").strip()[:80]
+            video_desc = (meta.get("desc") or "").strip()[:200]
+        except Exception:
+            pass
+
     return {
         "id": str(raw.get("id") or ""),
         "feed": raw.get("_feed", "at"),
@@ -1741,6 +1780,9 @@ def parse_event(raw: dict, show_content: bool, resolver: CommentResolver = None)
         "nickname": (user.get("nickname") or "未知用户").strip(),
         "ts": ts,
         "bv": bv,
+        "video_title": video_title,
+        "video_desc": video_desc,
+        "thread_root": thread_root[:300],
         "type": ctype_name,
         "content": content,
         "parent": parent_text,
@@ -1756,6 +1798,7 @@ def parse_event(raw: dict, show_content: bool, resolver: CommentResolver = None)
         "at_is_direct": bool(pinfo.get("at_is_direct")),
         "at_rpid": pinfo.get("at_rpid") or 0,
         "at_root": pinfo.get("at_root") or 0,
+        "fallback": bool(pinfo.get("fallback")),
         "reply_type": resolver._comment_type(item.get("business_id")) if resolver else None,
         "reply_oid": item.get("subject_id"),
         "replyable": bool(pinfo.get("parent_rpid")),
@@ -1964,6 +2007,31 @@ def parse_quiet_hours(spec: str):
         return (h1 * 60 + m1) % 1440, (h2 * 60 + m2) % 1440
     except Exception:
         return None
+
+
+def parse_since(spec: str):
+    """把 '2026-11-01 00:00' 之类解析成本地时间戳；空串返回 0，格式错误返回 None。
+
+    支持：2026-11-01 / 2026-11-01 08:30 / 2026-11-01 08:30:15 /
+         2026-11-01T08:30 / 2026/11/01 08:30（全角字符会自动转半角）
+    """
+    if not spec:
+        return 0
+    s = str(spec).strip()
+    for a, b in (("：", ":"), ("／", "/"), ("－", "-"), ("年", "-"), ("月", "-"),
+                 ("日", " "), ("T", " "), ("　", " ")):
+        s = s.replace(a, b)
+    s = " ".join(s.split())
+    formats = (
+        "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d",
+        "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M", "%Y/%m/%d",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(s, fmt).timestamp()
+        except ValueError:
+            continue
+    return None
 
 
 def in_quiet_hours(spec: str, now: datetime = None) -> bool:
@@ -2243,6 +2311,20 @@ class ReplyQueue:
         self.remove_item_for_key(key)
         self.dropped[key] = (reason or "")[:120]
 
+    def purge_before(self, ts: float) -> int:
+        """移除队列里 @ 时间早于 ts 的待回复事件，返回移除数量。"""
+        removed = 0
+        for item in list(self.pending):
+            ev = item.get("ev") or {}
+            try:
+                ets = int(ev.get("ts") or 0)
+            except (TypeError, ValueError):
+                ets = 0
+            if ets and ets < ts:
+                self.remove_item(item)
+                removed += 1
+        return removed
+
     def _prune_done(self):
         if len(self.done) <= self.MAX_DONE:
             return
@@ -2261,11 +2343,19 @@ def queue_reply(events: dict, keys, args, state: dict, resolver,
     """
     q = ReplyQueue(state)
 
+    since_ts = getattr(args, "since_ts", 0) or 0
+    if since_ts:
+        removed = q.purge_before(since_ts)
+        if removed:
+            log("  · 时间过滤器：从队列移除 %d 条更早的 @ 事件" % removed)
+
     new_keys = 0
     for key in keys:
         ev = events.get(key) or {}
         if not ev.get("replyable"):
             continue
+        if since_ts and int(ev.get("ts") or 0) and int(ev["ts"]) < since_ts:
+            continue                      # 早于时间过滤器：不入队
         if key in q.keys:
             q.update_event(key, ev)       # 已在队列里 → 用本轮数据刷新快照
             continue
@@ -2374,8 +2464,10 @@ def queue_reply(events: dict, keys, args, state: dict, resolver,
             stats["replied"] += 1
             log("  · 已回复并出队（验证%s，队列剩余 %d）"
                 % ("通过" if verified else "未通过但已记录", len(q)), "ok")
-        elif res.get("skipped") and ("找不到" in (res.get("reason") or "")
-                                     or "已删除" in (res.get("reason") or "")):
+        elif (res.get("skipped") and res.get("platform_checked")
+              and ("找不到" in (res.get("reason") or "")
+                   or "已删除" in (res.get("reason") or ""))):
+            # 只有「确实查过、确实不存在」才永久丢弃；风控/网络失败要留着重试
             q.drop(key, res.get("reason"))
             stats["skipped"] += 1
         else:
@@ -2417,6 +2509,7 @@ def fetch_round(cookie: str, args, state: dict, resolver: CommentResolver, round
             log("「回复我的」抓取失败，已跳过：%s" % exc, "warn")
 
     cutoff_ts = int((datetime.now() - timedelta(days=args.days)).timestamp()) if args.days > 0 else 0
+    since_ts = getattr(args, "since_ts", 0) or 0
     records = state.get("records") or {}
     replies = state.get("replies") or {}
     resolver.replied = replies
@@ -2433,25 +2526,34 @@ def fetch_round(cookie: str, args, state: dict, resolver: CommentResolver, round
             continue
         if cutoff_ts and ev["ts"] and ev["ts"] < cutoff_ts:
             continue
+        # 时间过滤器：早于 --since 的 @ 只记录，不进回复队列
+        too_old = bool(since_ts and ev["ts"] and ev["ts"] < since_ts)
         key = ev["id"] or ("%s:%s" % (ev["mid"], ev["ts"]))
         old = records.get(key)
         if old is None:
             records[key] = ev
             new_count += 1
-            to_reply.append(key)
+            if not too_old:
+                to_reply.append(key)
         else:
-            # 旧记录可能缺少回复所需字段 → 用本次结果补全
-            if not old.get("replyable"):
-                for fld in ("parent", "parent_rpid", "root_rpid", "parent_is_self",
-                            "replyable", "reply_type", "reply_oid", "content"):
+            # 每轮都用最新解析结果刷新父级信息（旧版本把 root_id 当 0，记录会残留错误结论）；
+            # 但本次是「父级获取失败回退」时，不覆盖已有正常数据
+            refresh_fields = ("parent", "parent_rpid", "root_rpid", "parent_is_self",
+                              "parent_is_direct", "at_is_direct", "at_rpid", "at_root",
+                              "parent_content", "parent_author",
+                              "grandparent_content", "grandparent_author",
+                              "replyable", "reply_type", "reply_oid", "content",
+                              "video_title", "video_desc", "thread_root")
+            if not old.get("replyable") or not ev.get("fallback"):
+                for fld in refresh_fields:
                     if ev.get(fld) is not None:
                         old[fld] = ev.get(fld)
                 old["collected_at"] = ev["collected_at"]
-                if not old.get("bv") and ev["bv"]:
-                    old["bv"] = ev["bv"]
+            if not old.get("bv") and ev["bv"]:
+                old["bv"] = ev["bv"]
             # 是否要回复由「平台验证」决定，本地台账只用于记录：
             # 每条可回复的记录都去平台确认一次（评论是否存在、我是否真的回复过）
-            if old.get("replyable"):
+            if old.get("replyable") and not too_old:
                 to_reply.append(key)
 
     # ---- 待回复队列：依次回复，确认后出队（单次队列内不重复回复同一评论） ----
@@ -2566,7 +2668,7 @@ def fetch_round(cookie: str, args, state: dict, resolver: CommentResolver, round
         log("有 %d 条回复因 CSRF 校验失败（-111）没有发出去。" % resolver.csrf_failures, "err")
         log("原因：bili_jct 与 SESSDATA 不是同一次登录产生的。", "err")
         log("解决办法（任选一种）：", "err")
-        log("  1) python %s --login   （扫码登录，自动写入配套的 SESSDATA + bili_jct）"
+        log("  1) python %s --login   （从浏览器读取，自动带上配套的 SESSDATA + bili_jct）"
             % os.path.basename(sys.argv[0] or __file__), "err")
         log("  2) 在浏览器 F12 → Application → Cookies 里，把同一次登录的 "
             "SESSDATA 和 bili_jct 一起复制，然后：", "err")
@@ -2626,20 +2728,31 @@ def parse_args(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "示例：\n"
-            "  python bili_at_monitor.py --login                 # 扫码登录\n"
+            "  python bili_at_monitor.py --login                 # 从浏览器读取 Cookie\n"
             "  python bili_at_monitor.py --sessdata xxx          # 常驻，每 300 秒抓一次\n"
             "  python bili_at_monitor.py --sessdata xxx --once   # 只抓一次\n"
             "  python bili_at_monitor.py --stop                  # 停止后台实例\n"
             "  python bili_at_monitor.py --status                # 查看运行状态\n"
         ),
     )
-    p.add_argument("--login", action="store_true", help="扫码登录并保存 Cookie")
+    p.add_argument("--login", action="store_true",
+                   help="从本机浏览器读取 B站 Cookie 并保存（需先完全退出浏览器）")
+    p.add_argument("--browser", choices=("edge", "chrome"), default="edge",
+                   help="从哪个浏览器读 Cookie（默认 edge）")
+    p.add_argument("--profile", default="",
+                   help='浏览器配置目录名，如 "Default" / "Profile 1"（默认自动找）')
     p.add_argument("--cookie", help="完整 Cookie 字符串")
+    p.add_argument("--cookie-file", default="",
+                   help="从指定 txt 文件读 Cookie（默认同目录 cookie.txt）")
     p.add_argument("--sessdata", help="只给 SESSDATA")
     p.add_argument("--check", action="store_true", help="只校验 Cookie 并显示未读数")
     p.add_argument("--status", action="store_true", help="显示累计条数与上次抓取时间")
     p.add_argument("--stats", action="store_true",
                    help="输出统计报表（分类分布 / 每日回复 / 用户榜 / 队列状态），并导出 stats.csv")
+    p.add_argument("--queue-list", action="store_true",
+                   help="列出待回复队列（带序号，便于取消）")
+    p.add_argument("--cancel-queue", default="",
+                   help='手动取消队列任务：填序号（1 或 1,3）或事件 key，all = 全部取消')
     p.add_argument("--quiet-hours", default="",
                    help='夜间静默时段，如 "23:00-07:00"（支持跨零点；此时段内不回复，队列保留）')
     p.add_argument("--allow-users", default="",
@@ -2658,7 +2771,7 @@ def parse_args(argv=None):
                    help="把额外的 Cookie 字段写入 cookie.txt（例如 --update-cookie \"bili_jct=xxx\"），"
                         "用于给已有的 SESSDATA 补上 bili_jct")
     p.add_argument("--auto-relogin", action="store_true",
-                   help="登录失效时自动重新扫码登录（常驻模式适用，需要有人扫手机）")
+                   help="登录失效时自动重新从浏览器读取 Cookie（常驻模式适用）")
     p.add_argument("--rounds", type=int, default=0, help="最多抓几轮后退出，0 = 一直运行")
 
     p.add_argument("--outdir", default=APP_DIR, help="输出目录（默认脚本所在目录）")
@@ -2676,6 +2789,9 @@ def parse_args(argv=None):
     p.add_argument("--include-replies", action="store_true", help="同时抓「回复我的」中含 @ 的通知")
     p.add_argument("--pages", type=int, default=0, help="最多抓几页，0 = 抓到完")
     p.add_argument("--days", type=int, default=0, help="只保留最近 N 天的 @，0 = 不限")
+    p.add_argument("--since", default="",
+                   help='时间过滤器：只把该时间之后的 @ 加入回复队列，'
+                        '如 "2026-11-01" 或 "2026-11-01 08:30"（留空=不限）')
     p.add_argument("--timeout", type=int, default=20, help="单次请求超时秒数（默认 20）")
     p.add_argument("--delay", type=float, default=1.0, help="请求间隔秒数（默认 1.0）")
     p.add_argument("--insecure", action="store_true", help="跳过 HTTPS 证书校验")
@@ -2702,10 +2818,16 @@ def parse_args(argv=None):
                    help="AI 决策日志路径（默认输出目录下 ai_decisions.jsonl）")
     p.add_argument("--credits-table", default="",
                    help="次数/信用表格路径（默认输出目录下 user_credits.csv）")
-    p.add_argument("--free-user", default=os.environ.get("BILI_FREE_UID", ""),
-                   help="特权 UID：该用户不扣次数/信用，回复中数值显示为 ∞（默认不启用）")
+    p.add_argument("--admins", default=os.environ.get("BILI_ADMINS", ""),
+                   help="管理员 UID 名单（逗号分隔）：不扣次数/信用，回复中数值显示 ∞")
+    p.add_argument("--free-user", default="",
+                   help="（旧参数，等价于往 --admins 里追加一个 UID）")
     p.add_argument("--ai-no-follow-check", action="store_true",
                    help="关闭「必须关注本账号才回复」的校验")
+    p.add_argument("--ai-opinion-mode", choices=("strict", "loose", "off"), default="loose",
+                   help="「只有观点、没有证据」的判定强度："
+                        "strict=保留原判定；loose=评论提到视频/上下文或带数字就不判（默认）；"
+                        "off=完全关闭该判定，一律按论证处理")
     return p.parse_args(argv)
 
 
@@ -2779,6 +2901,89 @@ def do_status(args):
     return 0
 
 
+def _queue_rows(state: dict):
+    q = ReplyQueue(state)
+    rows = []
+    for i, item in enumerate(list(q.pending), 1):
+        ev = item.get("ev") or {}
+        try:
+            ts = int(ev.get("ts") or 0)
+            when = datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M") if ts else "-"
+        except (TypeError, ValueError):
+            when = "-"
+        rows.append({
+            "index": i,
+            "key": item.get("key") or "",
+            "mid": str(ev.get("mid") or ""),
+            "nickname": ev.get("nickname") or "",
+            "when": when,
+            "content": (ev.get("content") or "").replace("\n", " ")[:40],
+            "attempts": item.get("attempts", 0),
+        })
+    return q, rows
+
+
+def do_queue_list(args) -> int:
+    state = load_state(args.state)
+    q, rows = _queue_rows(state)
+    if not rows:
+        log("待回复队列为空。", "ok")
+        return 0
+    log("待回复队列：%d 条（状态文件 %s）" % (len(rows), args.state))
+    print("  %-4s %-18s %-14s %-18s %-6s %s"
+          % ("#", "事件 key", "UID", "时间", "尝试", "@ 内容"))
+    for r in rows:
+        print("  %-4d %-18s %-14s %-18s %-6s %s"
+              % (r["index"], r["key"], r["mid"], r["when"], r["attempts"], r["content"]))
+    print()
+    print("取消单条：python %s --cancel-queue 1   (填上面的序号或 key)"
+          % os.path.basename(sys.argv[0]))
+    print("取消全部：python %s --cancel-queue all" % os.path.basename(sys.argv[0]))
+    return 0
+
+
+def do_queue_cancel(args) -> int:
+    state = load_state(args.state)
+    q, rows = _queue_rows(state)
+    spec = (args.cancel_queue or "").strip()
+    if not spec:
+        log("请指定要取消的条目：--cancel-queue 1,3 / all", "err")
+        return 2
+    if spec.lower() in ("all", "*", "全部"):
+        keys = [r["key"] for r in rows]
+    else:
+        keys = []
+        for part in spec.replace("，", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part.isdigit():
+                idx = int(part) - 1
+                if 0 <= idx < len(rows):
+                    keys.append(rows[idx]["key"])
+                else:
+                    log("序号 %s 超出范围（当前 %d 条）" % (part, len(rows)), "warn")
+            else:
+                keys.append(part)
+
+    cancelled, missing = [], []
+    for key in keys:
+        if key in q.keys:
+            q.drop(key, "手动取消")
+            cancelled.append(key)
+        else:
+            missing.append(key)
+    if cancelled:
+        save_state(args.state, state)
+        log("已取消 %d 条队列任务：%s" % (len(cancelled), "、".join(cancelled)), "ok")
+    else:
+        log("没有匹配到任何队列任务。", "warn")
+    if missing:
+        log("以下 key 不在队列中，已忽略：%s" % "、".join(missing), "warn")
+    log("剩余待回复：%d 条" % len(q.pending))
+    return 0
+
+
 def do_reset(args):
     state = load_state(args.state)
     if os.path.isfile(STOP_FILE):
@@ -2802,8 +3007,23 @@ def run(argv=None) -> int:
     args = parse_args(argv)
     set_quiet(args.quiet)
 
+    # ---- 时间过滤器：只把该时间之后的 @ 放进回复队列 ----
+    since_ts = parse_since(getattr(args, "since", ""))
+    if since_ts is None:
+        log("--since 时间格式无法识别：%r（示例：2026-11-01 或 2026-11-01 08:30）"
+            % getattr(args, "since", ""), "err")
+        return 2
+    args.since_ts = since_ts
+    if since_ts:
+        log("时间过滤器：只回复 %s 之后的 @（更早的只记录、不进队列）"
+            % datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S"), "ok")
+
     if args.stop:
         return do_stop()
+    if args.queue_list:
+        return do_queue_list(args)
+    if args.cancel_queue:
+        return do_queue_cancel(args)
     if args.status:
         return do_status(args)
     if args.stats:
@@ -2827,11 +3047,10 @@ def run(argv=None) -> int:
     if args.login or not cookie:
         if args.login:
             try:
-                cookie = qr_login()
-                save_cookie_to_state(cookie, args.state)
+                cookie = browser_login(args.browser, args.profile)
                 args.save_cookie = True
             except Exception as exc:
-                log("扫码登录失败：%s" % exc, "err")
+                log("从浏览器读取 Cookie 失败：%s" % exc, "err")
                 print_login_help()
                 return 2
         else:
@@ -2849,22 +3068,28 @@ def run(argv=None) -> int:
         nav = api_call(NAV_API, cookie=cookie, timeout=args.timeout,
                        retry_delay=args.delay, verify=verify)
     except AuthError as exc:
-        # 会话失效：后台常驻模式自动重新扫码登录（交互模式下用户可当场扫码）
+        # 会话失效：后台常驻模式自动从浏览器重新读取 Cookie
         if args.auto_relogin and not args.once and not args.check:
-            log("登录已失效（%s），尝试自动重新扫码登录 ..." % exc, "warn")
+            log("登录已失效（%s），尝试自动从 %s 重新读取 Cookie ..."
+                % (exc, args.browser), "warn")
             try:
-                cookie = qr_login()
+                cookie = browser_login(args.browser, args.profile)
                 save_cookie_to_state(cookie, args.state)
                 args.save_cookie = True
                 nav = api_call(NAV_API, cookie=cookie, timeout=args.timeout,
                                retry_delay=args.delay, verify=verify)
-                log("重新登录成功。", "ok")
+                log("重新读取登录态成功。", "ok")
             except Exception as exc2:
                 log("自动重新登录失败：%s" % exc2, "err")
                 print_login_help()
                 return 3
         else:
             log(str(exc), "err")
+            ck_path = getattr(args, "cookie_file", "") or os.path.join(APP_DIR, "cookie.txt")
+            if os.path.isfile(ck_path):
+                log("%s 已读到并被使用，但 B站 判定这份凭证已失效；"
+                    "换一份新的 Cookie 写回该文件即可（或 --login 从浏览器读取）。" % ck_path,
+                    "warn")
             print_login_help()
             return 3
     except Exception as exc:
@@ -2934,6 +3159,7 @@ def run(argv=None) -> int:
             api_key=args.ai_key, model=args.ai_model,
             max_reply_len=args.ai_max_len,
             search_enabled=not args.ai_no_search,
+            opinion_mode=getattr(args, "ai_opinion_mode", "loose"),
             log_func=lambda msg, level="i": log(msg, level))
         log("[AI] 法官模式已启用：模型 %s｜联网查证 %s｜每小时≤%d 条｜每日≤%d 条｜最小间隔 %ds"
             % (args.ai_model, "开" if not args.ai_no_search else "关",
@@ -2945,12 +3171,15 @@ def run(argv=None) -> int:
             table_path = args.credits_table or os.path.join(args.outdir, "user_credits.csv")
             state.setdefault("users", {})
             resolver.book = CreditBook(state["users"], table_path,
+                                       admins=getattr(args, "admins", ""),
                                        free_uid=getattr(args, "free_user", ""))
             resolver.book.refresh_all()
-            free_note = ("；特权 UID %s 不扣减（显示 ∞）" % resolver.book.free_uid
-                         if resolver.book.free_uid else "")
+            admin_list = sorted(resolver.book.admin_uids)
+            admin_note = ("；管理员 %d 人（不扣减、显示 ∞）：%s"
+                          % (len(admin_list), "、".join(admin_list))
+                          if admin_list else "；未设置管理员名单")
             log("[AI] 次数/信用已启用：每天重置次数、每周重置信用（0~3）；表格 %s%s"
-                % (table_path, free_note), "ok")
+                % (table_path, admin_note), "ok")
         except Exception as exc:
             log("[AI] 次数/信用初始化失败：%s" % exc, "err")
             return 6
@@ -2961,7 +3190,7 @@ def run(argv=None) -> int:
         resolver.level_blocked = True
     if args.reply and not extract_cookie_value(cookie, "bili_jct"):
         log("缺少 bili_jct（CSRF Token），无法发送回复 —— 已终止，避免你以为在回复其实没发。", "err")
-        log("解决办法：执行 python %s --login 重新扫码登录（会自动存下 bili_jct），"
+        log("解决办法：执行 python %s --login 从浏览器重新读取（会自动带上 bili_jct），"
             % os.path.basename(sys.argv[0] or __file__), "err")
         log("或在 cookie.txt 里补上 bili_jct=xxx（浏览器 Cookie 里能拿到）。", "err")
         log("若只想先看不发，去掉 --reply 即可（默认就是 dry-run）。", "err")

@@ -24,8 +24,25 @@ import os
 from datetime import datetime
 
 CREDIT_MAX = 3
-# 特权 UID：不扣减、数值显示 ∞。默认空 = 不启用，可用环境变量 BILI_FREE_UID 指定
-FREE_UID = os.environ.get("BILI_FREE_UID", "").strip()
+
+
+def parse_uids(spec) -> set:
+    """把 '123,456，789' / 列表 解析成 {"123","456","789"}。"""
+    if not spec:
+        return set()
+    if isinstance(spec, (list, tuple, set)):
+        items = spec
+    else:
+        items = str(spec).replace("，", ",").split(",")
+    return {str(x).strip() for x in items if str(x).strip()}
+
+
+# 管理员名单：不扣次数/信用、数值显示 ∞。
+# 默认读环境变量 BILI_ADMINS（逗号分隔）；命令行 --admins 会覆盖它。
+ADMINS = parse_uids(os.environ.get("BILI_ADMINS", ""))
+# 兼容旧变量名
+ADMINS |= parse_uids(os.environ.get("BILI_FREE_UID", ""))
+FREE_UID = next(iter(ADMINS), "")
 
 SUFFIX_CREDIT = "信用-1，当前信用为{n}/3"
 SUFFIX_TIMES = "今日次数-1，当前次数为{n}/3"
@@ -76,16 +93,26 @@ def _norm_uid(uid) -> str:
 class CreditBook:
     """管理所有 @ 人的次数/信用，并可导出成 CSV 表格。
 
-    free_uid：特权用户（不扣减、数值显示 ∞）。默认取环境变量 BILI_FREE_UID，
-    留空表示不启用。
+    admins：管理员名单（不扣减、数值显示 ∞）。
+      默认取环境变量 BILI_ADMINS；命令行 --admins 可覆盖。
+      free_uid 参数为兼容旧版保留，等价于往名单里加一个人。
     """
 
-    def __init__(self, users: dict = None, table_path: str = "", free_uid=None):
+    def __init__(self, users: dict = None, table_path: str = "", admins=None,
+                 free_uid=None):
         self.users = users if isinstance(users, dict) else {}
         self.table_path = table_path
-        if free_uid is None:
-            free_uid = FREE_UID
-        self.free_uid = str(free_uid or "").strip()
+        if admins is None:
+            base = set(ADMINS)
+        else:
+            base = parse_uids(admins)
+        base |= parse_uids(free_uid)
+        self.admin_uids = base
+
+    @property
+    def free_uid(self):
+        """兼容旧代码：返回名单里的第一个人（没有则空串）。"""
+        return next(iter(self.admin_uids), "") if self.admin_uids else ""
 
     # ---------------- 记录 / 重置 ----------------
     def ensure(self, uid, nickname: str = "") -> dict:
@@ -136,7 +163,7 @@ class CreditBook:
 
     # ---------------- 查询 / 扣减 ----------------
     def is_free(self, uid) -> bool:
-        return bool(self.free_uid) and _norm_uid(uid) == self.free_uid
+        return _norm_uid(uid) in self.admin_uids
 
     def value(self, uid, kind: str) -> int:
         rec = self.refresh(uid)

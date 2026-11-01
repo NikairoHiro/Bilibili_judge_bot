@@ -40,7 +40,7 @@
 - **次数与信用**：每个 @ 我的人两个 0~3 的计数，按日 / 按周重置，归零后不再实质回复
 - **持久化队列**：一个事件只回一条，回复发出并经平台验证后出队；不同事件可对同一评论各回一条
 - **风险控制**：最小间隔、每小时 / 每日上限、风控熔断、夜间静默、黑白名单、关注校验
-- **本地网页控制台**：启动 / 停止、队列、报表、用户、实时日志、扫码登录
+- **本地网页控制台**：启动 / 停止、队列、报表、用户、实时日志、从浏览器导入登录
 - **零依赖**：只用标准库，单文件即可运行
 
 ---
@@ -73,12 +73,75 @@ python bili_at_monitor.py --ai --ai-key sk-xxxxxxxx   :: 方式二：命令行
 
 ### 2. 登录 B站
 
+程序不再走扫码（二维码几分钟就失效），而是**直接从浏览器读取 Cookie**：
+
 ```bat
+:: 先完全退出 Edge（任务栏图标右键 → 退出），再执行：
 python bili_at_monitor.py --login
+
+:: 用 Chrome 的话：
+python bili_at_monitor.py --login --browser chrome
+
+:: 指定浏览器配置（多用户/多配置的情况）：
+python bili_at_monitor.py --login --profile "Profile 1"
 ```
 
-终端会生成二维码（同时写出 `qr_login.png` / `qr_login.html`），用 B站 App 扫码即可。
+读取的是本机浏览器里已登录的 B站会话（`SESSDATA`、`bili_jct` 等），全程在本机完成，不经过任何服务器。
 凭证保存在 `cookie.txt` 和 `_state.json`。
+
+两条解密路径：
+
+| Cookie 加密 | 处理方式 |
+| --- | --- |
+| `v10` / `v11`（传统） | DPAPI 解出主密钥 + AES-256-GCM 直接解密 |
+| `v20`（App-Bound，Chromium 127+ 默认） | 复制一份配置到临时目录，启动**无头浏览器**，通过 DevTools 协议 `Network.getCookies` 取回（浏览器自己能解），用完立即退出并删除临时目录 |
+
+> **必须先完全退出浏览器**：Cookie 库在浏览器运行时被独占锁定，连复制都做不到。
+> 若企业策略禁止 headless，或自动读取失败，程序会提示改用
+> `--cookie "SESSDATA=...; bili_jct=..."` 手动传入。
+
+> **网页控制台不能做登录**：控制台本身跑在浏览器里，浏览器开着就读不到 Cookie，
+> 「设置 → 登录」页只提供命令和复制按钮，登录请到终端执行。
+
+### 用 cookie.txt 登录（最简单，推荐当自动读取失败时用）
+
+把 Cookie 写进项目目录的 `cookie.txt` 即可，程序启动时会自动读取，优先级高于
+`_state.json` 里的旧凭证。支持这些写法：
+
+```txt
+SESSDATA=abc%2C123%2Cxx; bili_jct=deadbeef          # 一行，推荐
+SESSDATA=abc%2C123%2Cxx
+bili_jct=deadbeef                                    # 分两行
+Cookie: SESSDATA=abc%2C123%2Cxx; bili_jct=deadbeef   # 带 Cookie: 前缀
+abc%2C123%2Cxx                                       # 只有裸 SESSDATA 值
+# 注释行会被忽略
+```
+
+编码不限：UTF-8、带 BOM、记事本「Unicode」(UTF-16)、GBK 都能读；
+换行、引号、多余空格会被自动清理。
+
+想用别的文件名：`python bili_at_monitor.py --cookie-file D:\my_cookie.txt`。
+
+> 只有 `SESSDATA` 也能读取消息，但**发评论必须同时有 `bili_jct`**，
+> 否则程序以返回码 5 退出并提示。
+> 如果 `cookie.txt` 读到了但 B站 判定失效，日志会明确说「已读到并被使用，但凭证已失效」，
+> 这时只需把新的 Cookie 覆盖写进该文件，不用重启参数。
+
+### v20（App-Bound）读不到怎么办
+
+依次尝试：
+
+1. **确认浏览器已完全退出**（任务栏图标右键 → 退出），再跑 `--login`；
+2. 程序会自动用无头 Edge 解密，若被安全软件/组策略拦住，看日志里的具体报错；
+3. 手动兜底：F12 → Application → Cookies → 复制 `SESSDATA` 与 `bili_jct`，
+   用 `--cookie "SESSDATA=...; bili_jct=..."` 传入；
+4. 管理员兜底：关闭 Edge 的 App-Bound 加密（Cookie 会退回 v10，本程序可直接解）：
+
+```bat
+reg add "HKLM\SOFTWARE\Policies\Microsoft\Edge" /v ApplicationBoundEncryptionEnabled /t REG_DWORD /d 0 /f
+```
+
+改完重启 Edge、退出登录再登录一次，让 Cookie 重新以 v10 写入。
 
 ### 3. 先试运行（不发评论）
 
@@ -114,7 +177,7 @@ python gui.py
 | 报表 | 分类分布、最近 7 天趋势、@ 我最多的人 |
 | 用户 | 每个人的次数 / 信用 / @我次数 / 最后互动 |
 | 日志 | 实时日志 |
-| 设置 | 全部参数 + 扫码登录 |
+| 设置 | 全部参数 + 从浏览器读取 Cookie |
 
 服务只监听 `127.0.0.1`，不对外网开放。关掉网页不会停止机器人。
 
@@ -163,6 +226,27 @@ python bili_at_monitor.py --reset
 - 判定由语言模型完成，存在波动；置信度低时会二次判定并按确定性规则裁决
 - 所有固定文案集中在 `deepseek_judge.py` 顶部，可直接修改（含一句带调侃意味的固定回复）
 
+### 视频信息与「只有观点」判定
+
+很多人的论据其实在视频里，评论里未必复述。为此：
+
+- 每条 @ 会顺带取一次视频标题 / 简介（按 BV 号缓存，不重复请求），拼进判断材料；
+- **楼层根评论**（msgfeed 的 `item.title` 字段）也会作为上下文一并交给模型，
+  这段是免费的，不额外发请求；
+- 命中以下任一情况时，**不判**「只有观点」：评论给了理由（因为/所以/数据显示…）、
+  提到视频或上下文（视频里/这期/UP主/上面/评论区…）、出现具体数字；
+- 真的只剩一句光秃秃的结论时，只做判断、**不索要证据、不追问依据**，也不提
+  「依据可能藏在视频/上下文里」，例如：
+  「这句只有结论，字面上没有可核对的支持，目前只能视为个人判断。」
+
+用 `--ai-opinion-mode` 控制强度：
+
+| 取值 | 行为 |
+| --- | --- |
+| `loose`（默认） | 引用视频/上下文或带数字就不判 |
+| `off` | 完全关闭该判定，一律按论证处理 |
+| `strict` | 保留模型的原始判断（回复仍是「只判断、不索证」的风格，不会判「错误」） |
+
 ---
 
 ## 次数与信用
@@ -176,8 +260,14 @@ python bili_at_monitor.py --reset
 
 归零后不再对其作出实质回复，直到重置。数据保存在 `user_credits.csv`。
 
-可选「特权 UID」：通过 `--free-user` 或环境变量 `BILI_FREE_UID` 指定一名用户，
-其计数永不减少，回复中的数值显示为 `∞`。**默认不启用。**
+**管理员名单**：通过 `--admins` 或环境变量 `BILI_ADMINS` 指定若干 UID（逗号分隔），
+名单内的人计数永不减少，回复中的数值显示为 `∞`。默认不启用，留空即关闭。
+
+```bat
+python bili_at_monitor.py --ai --reply --admins "1331065292,123456"
+```
+
+网页控制台「设置 → 管理员 UID」也可以填。旧参数 `--free-user` 仍可用（等价于追加一个 UID）。
 
 ---
 
@@ -190,6 +280,45 @@ python bili_at_monitor.py --reset
 - **失败保留**：网络 / 风控 / 配额等临时失败留在 `pending`，下一轮继续；连续失败 5 次才丢弃
 - **评论已删除**：丢弃并记录原因
 - `done` 上限 2000 条，超出按时间淘汰
+
+### 时间过滤器（--since）
+
+只回复某个时间点之后的 @，更早的**只记录、不进队列**：
+
+```bat
+python bili_at_monitor.py --ai --reply --since "2026-11-01"
+python bili_at_monitor.py --ai --reply --since "2026-11-01 08:30"
+```
+
+- 支持 `2026-11-01` / `2026-11-01 08:30` / `2026-11-01 08:30:15` / `2026/11/01 08:30`，
+  全角冒号、斜杠、年月日汉字也能识别；
+- 启动时会把队列里更早的待回复事件**清掉**，避免"翻旧账"；
+- 判定依据是 @ 事件的时间（`reply_time`），不是评论发布时间；
+- 格式写错会直接以返回码 2 退出，不会静默忽略。
+
+网页控制台「设置 → 只回复此时间之后的 @」对应同一个参数。
+
+### 手动取消队列任务
+
+```bat
+:: 列出待回复队列（带序号、UID、时间、内容）
+python bili_at_monitor.py --queue-list
+
+:: 按序号取消（可多个）
+python bili_at_monitor.py --cancel-queue 1
+python bili_at_monitor.py --cancel-queue 1,3
+
+:: 按事件 key 取消
+python bili_at_monitor.py --cancel-queue 1191567398608899
+
+:: 全部清空
+python bili_at_monitor.py --cancel-queue all
+```
+
+- 被取消的条目会从 `pending` 移到 `dropped`，原因记为「手动取消」，可在 `--stats` 或控制台的「已丢弃」里看到；
+- key 填错只会提示忽略，不会报错；
+- **建议在机器人停止时执行**：运行中的实例把队列放在内存里，会在本轮结束时覆盖文件。
+- 网页控制台「队列 → 待回复」每行有「取消」按钮，右上角有「清空待回复」。
 
 ---
 
@@ -211,10 +340,15 @@ python bili_at_monitor.py --reset
 | `--ai-max-len` | 400 | 单条回复最大长度 |
 | `--ai-no-search` | 关 | 关闭联网查证 |
 | `--quiet-hours` | 空 | 夜间静默，如 `23:00-07:00` |
+| `--since` | 空 | 时间过滤器：只把该时间之后的 @ 加入回复队列 |
+| `--queue-list` | — | 列出待回复队列（带序号） |
+| `--cancel-queue` | — | 取消队列任务：`1` / `1,3` / `事件key` / `all` |
 | `--allow-users` | 空 | 只回这些 UID |
 | `--block-users` | 空 | 永不回复这些 UID |
-| `--free-user` | 空 | 特权 UID（不扣减，显示 ∞） |
-| `--ai-no-follow-check` | 关 | 关闭「必须关注」校验 |
+| `--admins` | 空 | 管理员 UID 名单：不扣减、显示 ∞ |
+| `--free-user` | 空 | 旧参数，等价于往 `--admins` 追加一个 UID |
+| `--ai-no-follow-check` | 关 | 关闭「必须关注本账号」校验 |
+| `--ai-opinion-mode` | `loose` | 「只有观点、没有证据」判定强度：`strict` / `loose` / `off` |
 | `--credits-table` | `user_credits.csv` | 积分表路径 |
 
 ### 环境变量
@@ -223,7 +357,8 @@ python bili_at_monitor.py --reset
 | --- | --- |
 | `DEEPSEEK_API_KEY` | DeepSeek API Key |
 | `DEEPSEEK_MODEL` | 覆盖默认模型（测试脚本用） |
-| `BILI_FREE_UID` | 特权 UID，等价于 `--free-user` |
+| `BILI_ADMINS` | 管理员 UID 名单（逗号分隔），等价于 `--admins` |
+| `BILI_FREE_UID` | 旧变量名，等价于追加一名管理员 |
 | `BILI_SESSDATA` / `BILI_JCT` | 供 `post_comment_test.*` 使用，免写 cookie.txt |
 | `PYTHONIOENCODING` | Windows 控制台建议设为 `utf-8` |
 
@@ -267,7 +402,7 @@ python bili_at_monitor.py --reset
 - **判定有波动**：分类由模型给出，同一条评论两次结果可能不同（已用置信度二次判定缓解）
 - **事实核查较浅**：仅有搜索摘要，不校验来源权威性与时效性
 - **不理解反讽**：可能按字面意思处理
-- **Cookie 会失效**：B站服务端可能提前作废会话，需要重新扫码
+- **Cookie 会失效**：B站服务端可能提前作废会话，需要重新从浏览器导入
 - **仅支持单账号**：没有多账号隔离
 
 ---
@@ -285,6 +420,15 @@ A：B站要求 LV2 以上才能评论。
 
 **Q：控制台中文乱码？**
 A：Windows 默认 GBK，用 `启动控制台.bat`（内部已 `chcp 65001`），或设置 `PYTHONIOENCODING=utf-8`。
+
+**Q：提示「父级评论获取失败，改用 @ 原文」？**
+A：B站评论接口返回 412（风控）或该评论已删除 / 被折叠。程序会自动冷却 120 秒，
+风控期间的失败不会写进永久缓存、也不会把事件丢弃；持续出现时请调大 `--interval`
+或重新从浏览器导入 Cookie。
+
+**Q：为什么明明是在回复别人，却被当成「一级评论」？**
+A：B站 2026 起 `msgfeed` 的 `item.root_id` 恒为 0。程序会从 `native_uri` 里的
+`comment_root_id`（以及 `target_id`）推断所在楼，正常情况无需手动处理。
 
 **Q：想重跑已经回复过的事件？**
 A：删除 `_state.json` 中 `reply_queue.done` 里对应的条目（或整个 `reply_queue`）。
@@ -307,8 +451,8 @@ python _verify_queue_evidence.py
 set DEEPSEEK_API_KEY=sk-xxxx
 python _test_ai_judge.py
 
-:: 二维码生成器测试（离线）
-python _test_qr_offline.py
+:: 浏览器 Cookie 读取测试（离线合成数据）
+python _test_edge_cookie.py
 
 :: 评论发送最小验证（需要一个真实视频 BV 号）
 python post_comment_test.py --bvid BV1xx411c7mD
@@ -321,7 +465,7 @@ python post_comment_test.py --bvid BV1xx411c7mD
 | `bili_at_monitor.py` | 抓取、解析、发送、队列、额度、命令行 |
 | `deepseek_judge.py` | 分类、谬误分析、联网查证、话术生成 |
 | `user_credits.py` | 次数 / 信用积分簿 |
-| `qr_offline.py` | 纯 Python 二维码生成（登录用） |
+| `edge_cookie.py` | 从 Edge / Chrome 读取并解密 Cookie（DPAPI + AES-256-GCM） |
 | `gui.py` | 本地网页控制台 |
 | `_test_*.py` | 测试脚本 |
 
@@ -334,7 +478,7 @@ python post_comment_test.py --bvid BV1xx411c7mD
 ├── bili_at_monitor.py      # 主程序
 ├── deepseek_judge.py       # AI 判定与话术
 ├── user_credits.py         # 次数 / 信用
-├── qr_offline.py           # 二维码生成
+├── edge_cookie.py          # 浏览器 Cookie 读取
 ├── gui.py                  # 网页控制台
 ├── post_comment_test.py    # 发评测试（Python）
 ├── post_comment_test.js    # 发评测试（Node，可选）

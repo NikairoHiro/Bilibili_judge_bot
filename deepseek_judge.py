@@ -128,6 +128,14 @@ REASON_MARKERS = (
     "导致", "否则", "既然", "之所以",
 )
 
+# 出现这些词，说明论据可能在视频 / 上下文里 → 不判「只有观点」（loose 模式）
+CONTEXT_MARKERS = (
+    "视频", "这期", "这集", "这一期", "up", "UP", "up主", "UP主",
+    "他说", "她说", "上面", "前面", "楼主", "评论区", "这段", "那句",
+    "原视频", "里面", "这歌", "这剧", "这游戏", "这电影", "这操作",
+    "这一波", "这波", "片头", "片尾", "开头", "结尾", "讲到", "提到",
+)
+
 
 def has_reason(text: str) -> bool:
     """评论里是否给出了理由/依据（粗判，用于兜底纠正分类）。"""
@@ -152,6 +160,17 @@ def has_profanity(text: str) -> bool:
     low = text.lower().replace(" ", "")
     return any(w in low for w in PROFANITY_MARKERS)
 
+
+def references_context(text: str) -> bool:
+    """评论是否在引用视频 / 上下文（论据可能就在视频里）。"""
+    if not text:
+        return False
+    low = text.lower().replace(" ", "")
+    if any(w.lower() in low for w in CONTEXT_MARKERS):
+        return True
+    # 出现数字/百分比，通常是在引用某个数据
+    return bool(re.search(r"\d", text))
+
 DEFAULT_MODEL = "deepseek-flash"       # 实测可用：deepseek-flash / deepseek-v4-pro
 DEFAULT_BASE = "https://api.deepseek.com/chat/completions"
 
@@ -160,6 +179,9 @@ JUDGE_SYSTEM = (
     "你是一位「理智客观，辩证看待事情」的法官。"
     "你对任何言论都保持冷静、克制、就事论事，既不迎合也不谩骂，"
     "只依据文字本身做分析和判断，不臆测作者动机。"
+    "写作约束：回复时不要向对方索要证据或追问依据，"
+    "也不要说「依据可能在视频里 / 在上下文里 / 在材料里」这类话；"
+    "只就现有文字下判断。"
 )
 
 # 第一步：分类（只输出 JSON）
@@ -182,6 +204,10 @@ CLASSIFY_PROMPT = """请判断下面这条评论的主要性质，从以下五�
 或者出现了用具体数字/事实来支撑结论的句子，就一律算 argument。
 **即使你认为这个理由不成立、不充分、甚至可能是编造的，也必须判为 argument**
 （真假留给后面联网核对，不要在分类阶段否定它）；opinion 只用于「通篇只有表态、一个理由都没有」。
+
+另外：如果评论在引用视频内容、上下文、楼层里别人的话（例如"视频里说""这期""up主""
+上面那个""他不是说了吗"），说明论据可能藏在视频或上下文里，**不要判 opinion**，判 argument。
+opinion 的门槛很高：只有一个结论、没有理由、没有数字、也没有指向任何上下文，才算。
 
 同时：
 - 若是 facts，把需要查证的具体主张抽成 claims（最多 3 条，每条一句话）。
@@ -220,6 +246,8 @@ __SEARCH_BLOCK__
 - 只有既无逻辑谬误、论据也都有据可查：才以「你这段话是「正确」的」开头，如实肯定其合理之处。
 - **全文只能有一个开头语**，绝不能同时出现「正确」和「错误」两种结论。
 - 若检索结果与评论内容无关、或根本没有检索结果：不要拿它当证据，也不要因此指责对方论据失实。
+- **不要要求对方补充证据**，也不要评价「他有没有在评论里写出依据」；
+  只针对它已经写出来的理由和数据判断是否成立。
 - 语气：理性、客观、克制；不骂人、不人身攻击、不嘲讽、不涉及无关话题。
 - 纯文本，不要 Markdown、不要标题符号，段落用换行即可。
 - 总长度不超过 __MAXLEN__ 个字符。
@@ -264,19 +292,20 @@ __COMMENT__
 """
 
 # 第二步（opinion）：只有观点没有证据，指出其缺什么证据
-OPINION_COMPOSE_PROMPT = """下面这条评论只有观点或结论，没有给出任何证据或理由。
+OPINION_COMPOSE_PROMPT = """下面这条评论只给了一个结论，字面上没有写出支持它的东西。
 
 评论原文：
 <comment>
 __COMMENT__
 </comment>
 
-请写一段回应，要求：
-- 明确指出它「只有观点、没有证据」，并具体说明它缺少哪些证据
-  （例如：数据来源、时间地点、样本范围、可核查的事实、推理依据等，要结合这条评论的具体内容来点）；
-- 说明在这些证据出现之前，为什么无法采信这个结论；
-- 语气客观、冷静，不骂人、不嘲讽、不反问式羞辱；
-- 纯文本，不要 Markdown，总长度不超过 __MAXLEN__ 个字符。
+请写一段简短回应（一到三句话），要求：
+- **不要向对方索要证据**，不要问「依据在哪」「请指出来」「是哪一段」，也不要用祈使句要求补充；
+- **不要提视频、上下文、材料**，不要说依据可能藏在别处；
+- 只做判断：这是一个结论，字面上没有可核对的支持，因此目前只能视为个人判断；
+- 不要说「你只有观点、却没有证据」这种判决式说法，也不要用「错误」二字；
+- 语气平和、就事论事，不嘲讽、不羞辱；
+- 纯文本，不要 Markdown，不超过 __MAXLEN__ 个字符。
 """
 
 
@@ -363,7 +392,7 @@ class Judge:
     def __init__(self, api_key: str, model: str = DEFAULT_MODEL,
                  base_url: str = DEFAULT_BASE, timeout: int = 60,
                  max_reply_len: int = 400, search_enabled: bool = True,
-                 log_func=None):
+                 log_func=None, opinion_mode: str = "loose"):
         self.api_key = api_key
         self.model = model
         self.base_url = base_url
@@ -371,6 +400,10 @@ class Judge:
         self.max_reply_len = max_reply_len
         self.search_enabled = search_enabled
         self.log = log_func or (lambda msg, level="i": None)
+        # 「只有观点、没有证据」的判定强度：strict 保留 / loose 上下文相关就不判 / off 关闭
+        self.opinion_mode = (opinion_mode or "loose").strip().lower()
+        if self.opinion_mode not in ("strict", "loose", "off"):
+            self.opinion_mode = "loose"
         self.calls = 0          # 本次运行累计 API 调用次数（便于控制成本）
         self.last_error = ""
 
@@ -593,6 +626,28 @@ class Judge:
         if grand:
             analyzed = ("上下文（父级评论所回复的那条评论）：%s\n待分析评论：%s" % (grand, parent))
 
+        # 视频信息：很多人的论据其实在视频里，先把标题/简介给模型，再让它判断有没有论据
+        v_title = (ev.get("video_title") or "").strip()
+        v_desc = (ev.get("video_desc") or "").strip()
+        # 楼层根评论：msgfeed 的 item.title 就是根评论原文，零成本的一段上下文
+        root_comment = (ev.get("thread_root") or "").strip()
+        if root_comment in (parent, grand, at_content):
+            root_comment = ""
+
+        ctx_bits = []
+        if v_title or v_desc:
+            line = []
+            if v_title:
+                line.append("标题：%s" % v_title)
+            if v_desc:
+                line.append("简介：%s" % v_desc)
+            ctx_bits.append("【视频信息（评论可能引用它，不要臆测未写出的内容）】%s"
+                            % "；".join(line))
+        if root_comment:
+            ctx_bits.append("【楼层根评论（可能是对方论据的来源）】%s" % root_comment[:300])
+        if ctx_bits:
+            analyzed = "\n".join(ctx_bits) + "\n\n" + analyzed
+
         # ---- ②-b 论据：@ 我的人的原话一律并入材料（不再要求「视频信息」关键词） ----
         if at_content and at_content != parent and at_content != grand:
             analyzed = (analyzed + "\n\n@ 我的人的原话（一并作为材料）：\n" + at_content)
@@ -614,12 +669,26 @@ class Judge:
 
         category = analysis["category"]
 
-        # 兜底：模型把「有理由的论证」误判成 opinion 时，纠正为 argument
-        if category == "opinion" and has_reason(analyzed):
+        # 只用评论本身判断「有没有理由/上下文」，不要被上面拼进去的视频信息误导
+        comment_text = "\n".join(x for x in (grand, parent, at_content) if x)
+
+        # 兜底 1：模型把「有理由的论证」误判成 opinion 时，纠正为 argument
+        if category == "opinion" and has_reason(comment_text):
             category = "argument"
             analysis["category"] = "argument"
             analysis["note"] = "评论给出了理由，请核对理由是否有据、推理是否成立"
             result["ai_reason_override"] = "有理由标记，opinion → argument"
+
+        # 兜底 2：「只有观点」的判定强度由 opinion_mode 控制
+        #   strict = 保留模型判断；loose = 引用视频/上下文或带数字就不判；off = 完全不判
+        if category == "opinion" and self.opinion_mode != "strict":
+            if self.opinion_mode == "off" or references_context(comment_text):
+                category = "argument"
+                analysis["category"] = "argument"
+                analysis["note"] = ("评论给出了理由或指向，请按论证处理："
+                                    "先核对论据是否成立，再判断推理。")
+                result["ai_reason_override"] = (
+                    "opinion → argument（opinion_mode=%s）" % self.opinion_mode)
 
         # 闲聊：固定开头，但回复给「@ 我的人」而不是上级评论
         if category == "offtopic":
@@ -644,7 +713,7 @@ class Judge:
             result.update(
                 text=text, category=category,
                 reason=("判定为情绪输出/骂人，已按原评论怼回" if category == "emotional"
-                        else "判定为只有观点、没有证据，已指出缺失的证据"),
+                        else "判定为只有结论、没有可核对的支持（不索要证据）"),
                 ai_calls=self.calls - before)
             return result
 

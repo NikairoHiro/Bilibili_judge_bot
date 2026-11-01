@@ -14,7 +14,8 @@ import re
 import sys
 
 SOURCE_EXT = {".py", ".js", ".bat", ".md", ".json", ".txt", ".yml", ".yaml"}
-SKIP_DIRS = {".git", "langup-ai-master", "__pycache__", "_test_out", ".venv", "venv"}
+SKIP_DIRS = {".git", "langup-ai-master", "__pycache__", "_test_out", ".venv", "venv",
+             "release", "release_v1.0.0", "dist", "build"}
 SKIP_FILES = {"cookie.txt", "_state.json", "gui_config.json", "user_credits.csv",
               "bilibili_at.txt", "bilibili_at.csv", "replied_parents.csv",
               "stats.csv", "ai_decisions.jsonl", "bili_at_monitor.log", "gui_run.log"}
