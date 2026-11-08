@@ -64,7 +64,7 @@ from datetime import datetime, timedelta
 # 常量
 # --------------------------------------------------------------------------
 
-__version__ = "1.0.1"
+__version__ = "1.0.5"
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 UA = (
@@ -1623,9 +1623,25 @@ class CommentResolver:
 # --------------------------------------------------------------------------
 
 
+# 翻页硬上限：即使 --pages 0（不限），也不允许无限翻页
+MAX_FEED_PAGES = 20          # 单次最多翻 20 页
+MAX_FEED_ITEMS = 400         # 单次最多收集 400 条
+
+
 def fetch_feed(api_url: str, cookie: str, max_pages: int, timeout: int,
                delay: float, verify: bool, verbose: bool = True):
+    """抓取消息列表（游标分页）。
+
+    防死循环：
+      · 游标 (id, time) 没有前进 → 停止；
+      · 一整页都是已抓过的条目 → 停止；
+      · 页数 / 条数达到硬上限 → 停止。
+    B站 的 @ 列表在条数刚好等于一页（20 条）时，cursor.is_end 可能一直为 false
+    且游标原地不动，旧实现会无限翻页（日志里出现过单轮 9527 页）。
+    """
     items = []
+    seen_ids = set()
+    seen_cursors = set()
     cursor_id = cursor_time = None
     page = 0
     while True:
@@ -1641,14 +1657,39 @@ def fetch_feed(api_url: str, cookie: str, max_pages: int, timeout: int,
                            verify=verify, referer="https://message.bilibili.com/")
         data = payload.get("data") or {}
         batch = data.get("items") or []
-        if verbose:
-            log("    [页 %d] 取到 %d 条（累计 %d）" % (page, len(batch), len(items) + len(batch)))
+        new_count = 0
         for it in batch:
+            iid = str(it.get("id") or "")
+            if iid and iid in seen_ids:
+                continue
+            if iid:
+                seen_ids.add(iid)
             it["_feed"] = "at" if api_url == AT_API else "reply"
             items.append(it)
+            new_count += 1
+        if verbose:
+            log("    [页 %d] 取到 %d 条（新增 %d，累计 %d）"
+                % (page, len(batch), new_count, len(items)))
+
         cursor = data.get("cursor") or {}
         cursor_id, cursor_time = cursor.get("id"), cursor.get("time")
         if cursor.get("is_end") or not batch or not cursor_id:
+            break
+        ckey = (str(cursor_id), str(cursor_time))
+        if ckey in seen_cursors:
+            if verbose:
+                log("    [!] 翻页游标没有前进，停止翻页（避免死循环）", "warn")
+            break
+        seen_cursors.add(ckey)
+        if new_count == 0:
+            if verbose:
+                log("    [!] 整页都是已取过的内容，停止翻页", "warn")
+            break
+        if len(items) >= MAX_FEED_ITEMS:
+            log("    达到单次抓取条数上限 %d，停止翻页" % MAX_FEED_ITEMS, "warn")
+            break
+        if page >= MAX_FEED_PAGES:
+            log("    达到单次抓取页数上限 %d，停止翻页" % MAX_FEED_PAGES, "warn")
             break
         if max_pages and page >= max_pages:
             break
@@ -3003,6 +3044,56 @@ def do_reset(args):
     return 0
 
 
+LOCK_FILE = os.path.join(APP_DIR, ".run_lock")
+
+
+def _acquire_run_lock():
+    """跨进程单实例锁：两个进程同时抓取会重复发评论。
+
+    Windows 用 msvcrt.locking，其他平台用 fcntl；进程退出时系统自动释放。
+    """
+    try:
+        fh = open(LOCK_FILE, "a+")
+    except OSError:
+        return None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        return None
+    try:
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+    except OSError:
+        pass
+    return fh
+
+
+def _release_run_lock(fh):
+    try:
+        if os.name == "nt":
+            import msvcrt
+            fh.seek(0)
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        fh.close()
+    except OSError:
+        pass
+
+
 def run(argv=None) -> int:
     args = parse_args(argv)
     set_quiet(args.quiet)
@@ -3147,6 +3238,7 @@ def run(argv=None) -> int:
 
     # ---- AI 法官模式 ----
     if args.ai:
+        args.ai_key = str(args.ai_key or "").strip()   # 去掉误输入的首尾空格
         if not args.ai_key:
             log("未提供 DeepSeek API Key（--ai-key 或环境变量 DEEPSEEK_API_KEY）", "err")
             return 6
@@ -3207,48 +3299,62 @@ def run(argv=None) -> int:
             return 4
         return 0
 
-    # ---- 常驻模式 ----
-    if os.path.isfile(STOP_FILE):
-        log("检测到停止标记 %s，常驻模式不会启动。" % STOP_FILE, "warn")
-        log("如需继续运行，请先执行 python %s --reset" % os.path.basename(sys.argv[0] or __file__))
-        return 0
-    log("进入常驻模式：每 %d 秒抓取一次；停止请执行 python %s --stop"
-        % (args.interval, os.path.basename(sys.argv[0] or __file__)))
-    log("输出文件：%s（原地更新，不会新建 txt）" % os.path.join(args.outdir, args.outfile))
-    round_no = state.get("round") or 0
-    start_round = round_no          # 基线固定在进入循环前，避免被 state 的更新带跑
-    while True:
-        round_no += 1
-        try:
-            fetch_round(cookie, args, state, resolver, round_no)
-        except AuthError as exc:
-            log("登录失效：%s" % exc, "err")
-            log("请重新执行 --login 或更新 SESSDATA 后重启脚本。", "err")
-            return 3
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            log("本轮抓取异常（不影响后续轮次）：%s" % exc, "warn")
-
-        if args.rounds and (round_no - start_round) >= args.rounds:
-            log("已达到指定轮数 %d，退出。" % args.rounds, "ok")
-            break
-
-        # 可被 --stop 提前打断的睡眠
-        slept = 0
-        while slept < args.interval:
-            if os.path.isfile(STOP_FILE):
-                break
-            time.sleep(min(1, args.interval - slept))
-            slept += 1
+    # ---- 单实例锁：两个进程同时抓取会重复回复 ----
+    lock_fh = _acquire_run_lock()
+    if lock_fh is None:
+        log("已有另一个实例在运行（%s 被占用），本次不启动。" % LOCK_FILE, "err")
+        log("若确认没有其它实例，删除该文件后重试。", "warn")
+        return 4
+    try:
+        # ---- 常驻模式 ----
         if os.path.isfile(STOP_FILE):
-            log("检测到停止标记，退出常驻模式。", "ok")
+            log("检测到停止标记 %s，常驻模式不会启动。" % STOP_FILE, "warn")
+            log("如需继续运行，请先执行 python %s --reset"
+                % os.path.basename(sys.argv[0] or __file__))
+            return 0
+        log("进入常驻模式：每 %d 秒抓取一次；停止请执行 python %s --stop"
+            % (args.interval, os.path.basename(sys.argv[0] or __file__)))
+        if args.interval < 60:
+            log("抓取间隔只有 %d 秒，过于频繁容易触发 B站 风控（412）；建议 ≥ 120 秒。"
+                % args.interval, "warn")
+        log("输出文件：%s（原地更新，不会新建 txt）"
+            % os.path.join(args.outdir, args.outfile))
+        round_no = state.get("round") or 0
+        start_round = round_no      # 基线固定在进入循环前，避免被 state 的更新带跑
+        while True:
+            round_no += 1
             try:
-                os.remove(STOP_FILE)
-            except Exception:
-                pass
-            break
-    return 0
+                fetch_round(cookie, args, state, resolver, round_no)
+            except AuthError as exc:
+                log("登录失效：%s" % exc, "err")
+                log("请重新执行 --login 或更新 SESSDATA 后重启脚本。", "err")
+                return 3
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                log("本轮抓取异常（不影响后续轮次）：%s" % exc, "warn")
+
+            if args.rounds and (round_no - start_round) >= args.rounds:
+                log("已达到指定轮数 %d，退出。" % args.rounds, "ok")
+                break
+
+            # 可被 --stop 提前打断的睡眠
+            slept = 0
+            while slept < args.interval:
+                if os.path.isfile(STOP_FILE):
+                    break
+                time.sleep(min(1, args.interval - slept))
+                slept += 1
+            if os.path.isfile(STOP_FILE):
+                log("检测到停止标记，退出常驻模式。", "ok")
+                try:
+                    os.remove(STOP_FILE)
+                except Exception:
+                    pass
+                break
+        return 0
+    finally:
+        _release_run_lock(lock_fh)
 
 
 def _selftest():

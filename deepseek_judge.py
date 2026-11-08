@@ -309,6 +309,31 @@ __COMMENT__
 """
 
 
+# 闲聊：让模型扮演《魔法少女的魔女审判》的二阶堂希罗来接话
+HIRO_SYSTEM = (
+    "你现在扮演《魔法少女的魔女审判》中的二阶堂希罗（二階堂ヒロ，Nikaidou Hiro）。"
+    "她是 15 岁的少女，囚犯编号 659，魔法是「死亡回溯」，与樱羽艾玛是儿时玩伴。"
+    "性格：说话直、冷静、带点毒舌和不服输，习惯先质疑再下判断，讨厌敷衍和装模作样；"
+    "对熟人嘴硬心软，但不会主动卖萌。"
+    "你始终以希罗的身份说话，用第一人称「我」，称对方「你」；"
+    "绝不承认自己是 AI、模型、程序或机器人，也不提「设定」「扮演」这类词。"
+)
+
+CHAT_COMPOSE_PROMPT = """有人在你（二阶堂希罗）的评论下面跟你搭话，内容偏闲聊，不是严肃辩论。
+
+对方的原话：
+<comment>
+__COMMENT__
+</comment>
+
+请用希罗的口吻接一句：
+- 一到三句话，口语化、自然，可以反问一句，但别长篇大论；
+- 保持冷静、直接、略毒舌的语气，不卖萌、不撒娇、不用 emoji；
+- 不索要证据、不点评视频内容、不提「视频」「上下文」；
+- 纯文本，不要 Markdown，不超过 __MAXLEN__ 个字符。
+"""
+
+
 # ============================ 提示词注入检测 ============================
 # 说明：「你是」单独出现太常见（如"你是错的"），这里只匹配「你是+角色/身份」这类
 # 真正的身份改写指令，避免误伤正常评论。
@@ -393,7 +418,7 @@ class Judge:
                  base_url: str = DEFAULT_BASE, timeout: int = 60,
                  max_reply_len: int = 400, search_enabled: bool = True,
                  log_func=None, opinion_mode: str = "loose"):
-        self.api_key = api_key
+        self.api_key = str(api_key or "").strip()   # 防止手滑多打的空格导致 401
         self.model = model
         self.base_url = base_url
         self.timeout = timeout
@@ -406,10 +431,14 @@ class Judge:
             self.opinion_mode = "loose"
         self.calls = 0          # 本次运行累计 API 调用次数（便于控制成本）
         self.last_error = ""
+        self.auth_failed = False    # Key 无效时置位，避免每轮反复请求
 
     # ---------------- 底层请求 ----------------
     def chat(self, messages, max_tokens: int = 700, temperature: float = 0.3,
              retries: int = 2):
+        if self.auth_failed:
+            raise DeepSeekError(
+                "DeepSeek API Key 无效（之前已返回 401），请更换 Key 后重启程序")
         body = json.dumps({
             "model": self.model,
             "messages": messages,
@@ -434,6 +463,8 @@ class Judge:
                     detail = exc.read().decode("utf-8", errors="replace")[:200]
                 except Exception:
                     pass
+                if exc.code == 401:
+                    self.auth_failed = True
                 last = DeepSeekError("DeepSeek HTTP %s %s" % (exc.code, detail))
                 # 4xx（除 429）不重试
                 if 400 <= exc.code < 500 and exc.code != 429:
@@ -586,6 +617,16 @@ class Judge:
             {"role": "user", "content": prompt},
         ], max_tokens=900, temperature=0.5)
 
+    def compose_chat(self, analyzed_text: str) -> str:
+        """闲聊：以二阶堂希罗的口吻接话。"""
+        prompt = (CHAT_COMPOSE_PROMPT
+                  .replace("__COMMENT__", analyzed_text)
+                  .replace("__MAXLEN__", str(self.max_reply_len)))
+        return self.chat([
+            {"role": "system", "content": HIRO_SYSTEM},
+            {"role": "user", "content": prompt},
+        ], max_tokens=600, temperature=0.9)
+
     # ---------------- 对外主入口 ----------------
     def build_reply(self, ev: dict, owner_mid_getter=None) -> dict:
         """根据一条 @ 事件生成回复文本。
@@ -609,15 +650,16 @@ class Judge:
                           reply_to="at")
             return result
 
-        # ---- ① @ 评论本身是不是「直接评论视频」的一级评论 ----
-        # 一级评论是在评论视频本身，机器人无法分析视频内容。
-        if ev.get("at_is_direct"):
-            result.update(text=pick_reply(REPLY_VIDEO_COMMENT_VARIANTS), category="video_comment",
-                          reason="@ 评论本身是直接评论视频的一级评论，按规则不接入 API",
-                          reply_to="at")
-            return result
+        # ---- ① 楼主评论（顶层/一级评论）也一律交给 AI 判断 ----
+        # 旧逻辑对顶层评论直接回「看不到视频内容」的固定话术，导致：
+        #   · 动态（opus）评论被当成视频评论，回复牛头不对马嘴；
+        #   · 楼主自己写的评论内容从未被分析。
+        # 现在顶层评论同样进入分类 → 回复流程，回复目标是这条评论本身。
+        at_is_direct = bool(ev.get("at_is_direct"))
 
-        # ---- ② 取待分析文本：父级评论 + 它所回复的评论 ----
+        # ---- ② 取待分析文本：父级评论（顶层评论时就是 @ 原文）+ 它所回复的评论 ----
+        if not parent and at_content:
+            parent = at_content
         if not parent:
             result.update(skipped=True, reason="没有可分析的父级评论文本")
             return result
@@ -625,6 +667,9 @@ class Judge:
         analyzed = parent
         if grand:
             analyzed = ("上下文（父级评论所回复的那条评论）：%s\n待分析评论：%s" % (grand, parent))
+        elif at_is_direct:
+            analyzed = ("（这是直接发在作品下的顶层评论，没有上级评论，评的是作品或现象）\n"
+                        + analyzed)
 
         # 视频信息：很多人的论据其实在视频里，先把标题/简介给模型，再让它判断有没有论据
         v_title = (ev.get("video_title") or "").strip()
@@ -690,10 +735,18 @@ class Judge:
                 result["ai_reason_override"] = (
                     "opinion → argument（opinion_mode=%s）" % self.opinion_mode)
 
-        # 闲聊：固定开头，但回复给「@ 我的人」而不是上级评论
+        # 闲聊：调用 API，让希罗接话（不再用固定话术）
         if category == "offtopic":
-            result.update(text=pick_reply(REPLY_OFFTOPIC_VARIANTS), category=category,
-                          reason="判定为与辩证讨论无关（闲聊/灌水）",
+            try:
+                text = self.compose_chat(analyzed)
+            except DeepSeekError as exc:
+                result.update(skipped=True, reason="DeepSeek 生成失败：%s" % exc)
+                return result
+            text = self._fit_length((text or "").strip())
+            if not text:
+                text = pick_reply(REPLY_OFFTOPIC_VARIANTS)
+            result.update(text=text, category=category,
+                          reason="判定为闲聊，以二阶堂希罗的口吻接话",
                           reply_to="at", ai_calls=self.calls - before)
             return result
 

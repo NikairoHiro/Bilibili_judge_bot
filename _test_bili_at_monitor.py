@@ -1164,8 +1164,105 @@ check("all 之后队列为空", not _st4["reply_queue"]["pending"],
 
 check("取消不存在的 key 不报错", m.run(["--cancel-queue", "nope", "--state", _cp]) == 0)
 
+# --------------------------------------------------------------------------
+# 15. 抓取防死循环（游标不前进 / 整页重复 / 硬上限）
+# --------------------------------------------------------------------------
+print("\n== 抓取防死循环 ==")
+
+_orig_api = m.api_call
+
+
+def _feed(items, cursor):
+    return {"code": 0, "data": {"items": items, "cursor": cursor}}
+
+
+m.api_call = lambda url, *a, **kw: _feed(
+    [{"id": 1}, {"id": 2}], {"id": 111, "time": 222, "is_end": False})
+_items = m.fetch_feed(m.AT_API, "", 0, 1, 0, False, verbose=False)
+check("游标不前进 → 只抓一页", len(_items) == 2, len(_items))
+
+_calls = {"n": 0}
+
+
+def _dup(url, *a, **kw):
+    _calls["n"] += 1
+    return _feed([{"id": 1}], {"id": _calls["n"], "time": _calls["n"], "is_end": False})
+
+
+m.api_call = _dup
+_items = m.fetch_feed(m.AT_API, "", 0, 1, 0, False, verbose=False)
+check("整页重复 → 停止翻页", len(_items) == 1 and _calls["n"] == 2,
+      "%s / %s" % (len(_items), _calls["n"]))
+
+_seq = {"n": 0}
+
+
+def _endless(url, *a, **kw):
+    _seq["n"] += 1
+    return _feed([{"id": _seq["n"] * 10}, {"id": _seq["n"] * 10 + 1}],
+                 {"id": _seq["n"], "time": _seq["n"], "is_end": False})
+
+
+m.api_call = _endless
+_items = m.fetch_feed(m.AT_API, "", 0, 1, 0, False, verbose=False)
+check("命中页数硬上限 %d" % m.MAX_FEED_PAGES, _seq["n"] == m.MAX_FEED_PAGES,
+      _seq["n"])
+check("条数与页数上限一致", len(_items) == m.MAX_FEED_PAGES * 2, len(_items))
+
+m.api_call = _orig_api
+
+# --------------------------------------------------------------------------
+# 16. API Key 首尾空格会导致 401（已复现：Bearer 双空格 → 401）
+# --------------------------------------------------------------------------
+print("\n== API Key 空格处理 ==")
+
+check("Judge 会去掉 Key 首尾空格", dj.Judge("  sk-test  ").api_key == "sk-test",
+      repr(dj.Judge("  sk-test  ").api_key))
+
+import gui as _gui  # noqa: E402
+
+_old_cfg = _gui.CONFIG_PATH
+_gui.CONFIG_PATH = os.path.join(OUT, "gui_cfg_test.json")
+try:
+    _saved = _gui.save_config({"ai_key": "  sk-abc  ", "interval": "300"})
+finally:
+    _gui.CONFIG_PATH = _old_cfg
+check("保存配置时去掉 Key 首尾空格", _saved.get("ai_key") == "sk-abc",
+      repr(_saved.get("ai_key")))
+
+# --------------------------------------------------------------------------
+# 17. 楼主（顶层）评论也判断 + 闲聊走希罗人设
+# --------------------------------------------------------------------------
+print("\n== 楼主评论 / 闲聊 ==")
+
+_j = dj.Judge("sk-test", "deepseek-flash", max_reply_len=200)
+_j.classify = lambda text: {"category": "offtopic", "confidence": 0.9, "note": ""}
+_j.compose_chat = lambda text: "希罗：可爱这种话别拿来当开场白。"
+_ev_top = {
+    "id": "top1", "mid": "5", "nickname": "u", "content": "@我 你好可爱",
+    "parent_content": "你好可爱", "parent_author": "", "grandparent_content": "",
+    "at_is_direct": True, "reply_type": 11, "reply_oid": 414215011,
+    "parent_rpid": 1, "root_rpid": 1, "video_title": "", "video_desc": "",
+    "thread_root": "",
+}
+_r = _j.build_reply(_ev_top)
+check("楼主评论不再走固定话术", _r["category"] == "offtopic" and "希罗" in _r["text"],
+      "%s / %s" % (_r["category"], _r["text"]))
+check("闲聊回复目标是 @ 人", _r["reply_to"] == "at", _r["reply_to"])
+check("闲聊理由标明人设", "希罗" in (_r.get("reason") or ""), _r.get("reason"))
+
+# 楼主评论被判为论证时，也要真的生成内容（而不是「看不到视频内容」）
+_j2 = dj.Judge("sk-test", "deepseek-flash", max_reply_len=200)
+_j2.classify = lambda text: {"category": "argument", "confidence": 0.8,
+                             "fallacies": [], "note": ""}
+_j2.compose_argument = lambda text, analysis, evidence="": "希罗：这个推论站不住。"
+_ev_top2 = dict(_ev_top, content="@我 这期说得有道理", parent_content="这期说得有道理")
+_r2 = _j2.build_reply(_ev_top2)
+check("楼主评论会进入论证分析", "希罗：" in (_r2["text"] or ""), _r2["text"])
+check("不再出现「看不到视频内容」", "看不到视频" not in (_r2["text"] or ""), _r2["text"])
+
 print()
 if FAILS:
     print("[×] 失败 %d 项：%s" % (len(FAILS), FAILS))
     sys.exit(1)
-print("[√] 全部离线自测通过（父级评论 / 原地更新 / 常驻定时 / AI 法官 / 次数信用 / 队列 / 安全屏蔽 / 关注与配额 / 稳定性与报表 / 观点判定 / 时间过滤器 / 队列取消）")
+print("[√] 全部离线自测通过（父级评论 / 原地更新 / 常驻定时 / AI 法官 / 次数信用 / 队列 / 安全屏蔽 / 关注与配额 / 稳定性与报表 / 观点判定 / 时间过滤器 / 队列取消 / 防死循环）")

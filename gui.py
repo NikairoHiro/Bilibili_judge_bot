@@ -65,6 +65,11 @@ def load_config() -> dict:
             cfg.update({k: v for k, v in saved.items() if k in DEFAULT_CONFIG})
     except Exception:
         pass
+    # 配置里的字符串去掉首尾空白（手滑空格会让 API Key / 路径失效）
+    for k, v in list(cfg.items()):
+        if isinstance(v, str):
+            cfg[k] = v.strip()
+
     # 迁移自愈：换机器后旧配置里的绝对路径不存在 → 回落到脚本所在目录
     if not os.path.isdir(str(cfg.get("outdir") or "")):
         cfg["outdir"] = DEFAULT_CONFIG["outdir"]
@@ -85,6 +90,9 @@ def save_config(cfg: dict) -> dict:
                 v = int(v)
             except (TypeError, ValueError):
                 v = default
+        elif isinstance(default, str):
+            # 去掉首尾空白：手滑输入的空格会让 Authorization 头变成 "Bearer  sk-..."
+            v = str(v or "").strip()
         out[k] = v
     with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
         json.dump(out, fh, ensure_ascii=False, indent=2)
@@ -102,8 +110,8 @@ def build_argv(cfg: dict) -> list:
         argv += ["--ai-max-per-hour", str(cfg["ai_max_per_hour"])]
         argv += ["--ai-max-per-day", str(cfg["ai_max_per_day"])]
         argv += ["--ai-min-interval", str(cfg["ai_min_interval"])]
-        if cfg.get("ai_key"):
-            argv += ["--ai-key", str(cfg["ai_key"])]
+        if str(cfg.get("ai_key") or "").strip():
+            argv += ["--ai-key", str(cfg["ai_key"]).strip()]
         if cfg.get("no_search"):
             argv.append("--ai-no-search")
         if cfg.get("ai_opinion_mode"):
